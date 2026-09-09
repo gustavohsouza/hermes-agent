@@ -17,6 +17,9 @@ from typing import Any, BinaryIO, Mapping
 
 MAX_ENCODED_EVENT = 64 * 1024
 KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
+RFC3339_OFFSET_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 TRUNCATION_SUFFIX = "…[truncated]"
 DIAGNOSTIC_KEYS = frozenset({"source", "exit_code", "collector", "duration_ms"})
 TOP_LEVEL_FIELDS = frozenset({"version", "mode", "observed_at", "message", "active_keys", "new_keys", "gone_keys", "text", "diagnostics"})
@@ -73,7 +76,7 @@ def _keys(value: Any, field: str) -> list[str]:
 
 
 def _timestamp(value: Any) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not RFC3339_OFFSET_RE.fullmatch(value):
         raise IntakeError("invalid_observed_at")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -211,34 +214,95 @@ class Journal:
           incident_key TEXT NOT NULL UNIQUE, kanban_task_id TEXT, latest_applied_at TEXT NOT NULL,
           latest_applied_event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), latest_applied_digest TEXT NOT NULL,
           recurrence_root_event_id TEXT REFERENCES watchdog_events(event_id), recurrence_version INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS watchdog_daily_snapshot (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1), observed_at TEXT NOT NULL,
+          event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), full_digest TEXT NOT NULL,
+          active_keys_json TEXT NOT NULL);
         """)
         self.connection.commit()
 
-    def _last_daily_active(self) -> set[str]:
-        row = self.connection.execute(
-            "SELECT payload_json FROM watchdog_events WHERE json_extract(payload_json, '$.mode')='daily' "
-            "ORDER BY received_at DESC, event_id DESC LIMIT 1"
+    def close(self) -> None:
+        self.connection.close()
+
+    def _insert_event(self, event: CanonicalEvent, payload: Mapping[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        self.connection.execute(
+            "INSERT INTO watchdog_events(event_id,full_digest,payload_json,received_at,state) VALUES(?,?,?,?,?)",
+            (event.event_id, event.full_digest, _canonical_json(payload), now, "accepted"),
+        )
+
+    def _state(self, key: str) -> tuple[str, str, str] | None:
+        return self.connection.execute(
+            "SELECT lifecycle_state, latest_applied_at, latest_applied_digest "
+            "FROM watchdog_incident_state WHERE stable_key=?", (key,)
         ).fetchone()
-        return set(json.loads(row[0])["active_keys"]) if row else set()
+
+    def _is_ordered(self, key: str, observed_at: str, digest: str) -> bool:
+        state = self._state(key)
+        if state is None:
+            return True
+        lifecycle, latest_at, latest_digest = state
+        if observed_at < latest_at:
+            return False
+        if observed_at == latest_at and digest != latest_digest:
+            return False
+        return observed_at > latest_at
+
+    def _apply_transition(self, event: CanonicalEvent, key: str, transition: str) -> None:
+        state = self._state(key)
+        if not self._is_ordered(key, event.payload["observed_at"], event.full_digest):
+            return
+        if transition == "NEW" and state is not None and state[0] == "open":
+            return
+        if transition == "GONE" and (state is None or state[0] == "gone"):
+            return
+        lifecycle = "open" if transition == "NEW" else "gone"
+        recurrence = 1 if transition == "NEW" and state is not None and state[0] == "gone" else 0
+        self.connection.execute(
+            "INSERT INTO watchdog_incident_deliveries(event_id,stable_key,transition,incident_key,delivery_state) VALUES(?,?,?,?,?)",
+            (event.event_id, key, transition, incident_key(key), "pending"),
+        )
+        self.connection.execute(
+            "INSERT INTO watchdog_incident_state(stable_key,lifecycle_state,incident_key,latest_applied_at,latest_applied_event_id,latest_applied_digest,recurrence_root_event_id,recurrence_version) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(stable_key) DO UPDATE SET lifecycle_state=excluded.lifecycle_state, latest_applied_at=excluded.latest_applied_at, latest_applied_event_id=excluded.latest_applied_event_id, latest_applied_digest=excluded.latest_applied_digest, recurrence_version=watchdog_incident_state.recurrence_version + excluded.recurrence_version",
+            (key, lifecycle, incident_key(key), event.payload["observed_at"], event.event_id, event.full_digest, event.event_id, recurrence),
+        )
 
     def accept(self, raw: Mapping[str, Any]) -> AcceptedEvent:
         event = canonicalize_event(raw)
-        with self.connection:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
             existing = self.connection.execute("SELECT full_digest FROM watchdog_events WHERE event_id=?", (event.event_id,)).fetchone()
             if existing:
                 if existing[0] != event.full_digest:
                     raise IntakeError("event_id_collision")
+                self.connection.commit()
                 return AcceptedEvent(event.event_id, False)
             payload = dict(event.payload)
             if payload["mode"] == "daily":
-                prior, current = self._last_daily_active(), set(payload["active_keys"])
-                payload["new_keys"], payload["gone_keys"] = sorted(current - prior), sorted(prior - current)
-            now = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-            self.connection.execute("INSERT INTO watchdog_events(event_id,full_digest,payload_json,received_at,state) VALUES(?,?,?,?,?)", (event.event_id, event.full_digest, _canonical_json(payload), now, "accepted"))
+                snapshot = self.connection.execute("SELECT observed_at,full_digest,active_keys_json FROM watchdog_daily_snapshot WHERE singleton=1").fetchone()
+                self._insert_event(event, payload)
+                if snapshot is None or payload["observed_at"] > snapshot[0]:
+                    prior, current = set(json.loads(snapshot[2])) if snapshot else set(), set(payload["active_keys"])
+                    payload["new_keys"], payload["gone_keys"] = sorted(current - prior), sorted(prior - current)
+                    self.connection.execute("UPDATE watchdog_events SET payload_json=? WHERE event_id=?", (_canonical_json(payload), event.event_id))
+                    self.connection.execute("INSERT INTO watchdog_daily_snapshot(singleton,observed_at,event_id,full_digest,active_keys_json) VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at,event_id=excluded.event_id,full_digest=excluded.full_digest,active_keys_json=excluded.active_keys_json", (payload["observed_at"], event.event_id, event.full_digest, _canonical_json(payload["active_keys"])))
+                elif payload["observed_at"] == snapshot[0] and event.full_digest != snapshot[1]:
+                    self.connection.commit()
+                    return AcceptedEvent(event.event_id, True)
+                else:
+                    self.connection.commit()
+                    return AcceptedEvent(event.event_id, True)
+            else:
+                self._insert_event(event, payload)
             for key in payload["new_keys"]:
-                self.connection.execute("INSERT INTO watchdog_incident_deliveries(event_id,stable_key,transition,incident_key,delivery_state) VALUES(?,?,?,?,?)", (event.event_id, key, "NEW", incident_key(key), "pending"))
+                self._apply_transition(event, key, "NEW")
             for key in payload["gone_keys"]:
-                self.connection.execute("INSERT INTO watchdog_incident_deliveries(event_id,stable_key,transition,incident_key,delivery_state) VALUES(?,?,?,?,?)", (event.event_id, key, "GONE", incident_key(key), "pending"))
+                self._apply_transition(event, key, "GONE")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
         return AcceptedEvent(event.event_id, True)
 
     def pending_deliveries(self) -> list[tuple[str, str, str]]:

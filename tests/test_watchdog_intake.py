@@ -55,6 +55,7 @@ class CanonicalizationTests(unittest.TestCase):
         cases = [
             dict(BASE, mode="CHECK"),
             dict(BASE, observed_at="not-a-date"),
+            dict(BASE, observed_at="2026-09-09 17:05:33-03:00"),
             dict(BASE, message="bad\x00message"),
             dict(BASE, active_keys=["INVALID"]),
             dict(BASE, diagnostics={"secret": "should reject"}),
@@ -88,16 +89,49 @@ class CanonicalizationTests(unittest.TestCase):
 class JournalTests(unittest.TestCase):
     def test_duplicate_delivery_and_crash_retry_are_durable(self):
         with tempfile.TemporaryDirectory() as directory:
-            journal = Journal(Path(directory) / "journal.sqlite3")
+            path = Path(directory) / "journal.sqlite3"
+            journal = Journal(path)
             accepted = journal.accept(BASE)
             self.assertTrue(accepted.inserted)
             self.assertEqual(journal.pending_deliveries(), [(accepted.event_id, "proxy-erros", "NEW")])
+            journal.close()
+            journal = Journal(path)
             duplicate = journal.accept(BASE)
             self.assertFalse(duplicate.inserted)
             self.assertEqual(journal.pending_deliveries(), [(accepted.event_id, "proxy-erros", "NEW")])
             journal.acknowledge(accepted.event_id, "proxy-erros", "NEW", "t_123")
+            journal.close()
+            journal = Journal(path)
             self.assertEqual(journal.pending_deliveries(), [])
             self.assertEqual(journal.task_id(accepted.event_id, "proxy-erros", "NEW"), "t_123")
+
+    def test_daily_snapshots_apply_only_newer_ordering(self):
+        def daily(at, keys, message="snapshot"):
+            return {
+                "version": 1, "mode": "daily", "observed_at": at, "message": message,
+                "active_keys": keys,
+            }
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / "journal.sqlite3")
+            first = journal.accept(daily("2026-09-09T10:00:00Z", ["proxy-erros"]))
+            self.assertEqual(journal.pending_deliveries(), [(first.event_id, "proxy-erros", "NEW")])
+            newer = journal.accept(daily("2026-09-09T11:00:00Z", []))
+            self.assertEqual(sorted(journal.pending_deliveries()), sorted([
+                (first.event_id, "proxy-erros", "NEW"),
+                (newer.event_id, "proxy-erros", "GONE"),
+            ]))
+            stale = journal.accept(daily("2026-09-09T09:00:00Z", ["proxy-erros"]))
+            self.assertEqual(sorted(journal.pending_deliveries()), sorted([
+                (first.event_id, "proxy-erros", "NEW"),
+                (newer.event_id, "proxy-erros", "GONE"),
+            ]))
+            conflict = journal.accept(daily("2026-09-09T11:00:00Z", ["proxy-erros"], "conflict"))
+            self.assertTrue(conflict.inserted)
+            self.assertEqual(journal.event_count(), 4)
+            self.assertEqual(sorted(journal.pending_deliveries()), sorted([
+                (first.event_id, "proxy-erros", "NEW"),
+                (newer.event_id, "proxy-erros", "GONE"),
+            ]))
 
     def test_full_digest_collision_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
