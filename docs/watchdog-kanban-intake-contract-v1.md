@@ -45,7 +45,7 @@ Top-level schema:
       "diagnostics": {"optional": "bounded scalar context"}
     }
 
-Unknown top-level fields are rejected. `text` and `diagnostics` may be omitted and normalize to empty objects. Missing collections normalize to empty arrays only for `daily`; `check` requires every collection so that its transition semantics are explicit.
+Unknown top-level fields are rejected. `text` and `diagnostics` may be omitted and normalize to empty objects. `check` requires all three key collections. `daily` requires `active_keys` even when it is explicitly empty: absence rejects before any journal write, while `"active_keys": []` is a valid empty snapshot. For `daily`, `new_keys` and `gone_keys` are forbidden and reject if present; intake derives those transitions solely from the two durable snapshots. This makes an omitted snapshot fail closed rather than resolving every open incident.
 
 ## Bounds and validation
 
@@ -58,7 +58,7 @@ All strings are Unicode scalar text after strict UTF-8 decoding. Reject NUL (`U+
 | mode | exact lower-case `check` or `daily` | reject otherwise |
 | observed_at | RFC3339, UTC offset required, year 2000-2100 | reject otherwise |
 | message | string, max 16,384 UTF-8 bytes | reject, never truncate, because it is the exact opaque Watchdog message |
-| active/new/gone key input | arrays of at most 256 strings | reject type/count violations; canonicalize valid values |
+| active/new/gone key input | arrays of at most 256 strings | `check`: all required; `daily`: only `active_keys` required and `new_keys`/`gone_keys` forbidden; reject type/count violations; canonicalize valid values |
 | stable key | 1-96 ASCII chars matching `[a-z0-9][a-z0-9._-]{0,95}` | reject invalid keys |
 | text.summary | string, max 2,048 UTF-8 bytes | deterministic truncate with `…[truncated]` suffix |
 | text per key | object with canonical keys, at most 256 entries; each string max 1,024 UTF-8 bytes | discard entries for unknown keys; truncate string deterministically |
@@ -75,7 +75,8 @@ Required invariants after canonicalization:
 - `new_keys` is a subset of `active_keys`.
 - `gone_keys` is disjoint from `active_keys`.
 - no key occurs in both `new_keys` and `gone_keys`.
-- `daily` may have all collections empty and is then heartbeat-only.
+- a `daily` event with `active_keys: []` is an explicit empty full snapshot, not a heartbeat; omitted `active_keys` is invalid.
+- `daily` contains no caller-supplied `new_keys` or `gone_keys`; both are derived after ordering is accepted.
 - `check` may have all collections empty only as a heartbeat-only check event.
 
 Violation rejects the entire event before any persistent write.
@@ -129,7 +130,21 @@ Persist accepted data in an intake-owned SQLite journal located beneath the impl
       PRIMARY KEY(event_id, stable_key, transition)
     )
 
-Within one `BEGIN IMMEDIATE` transaction: insert an event in `accepted` state, insert its pending deliveries, and commit. Only then may the worker submit Kanban actions. A duplicate full digest is a successful no-op and resumes any pending/failed deliveries. A crash between journal commit and submission is recovered by selecting pending/failed deliveries. A crash after Kanban submission but before journal acknowledgement is recovered by querying/creating with the deterministic incident idempotency key, then recording the task ID. The implementation must not mark `submitted` until task ID is known and the journal update commits.
+    watchdog_incident_state(
+      stable_key TEXT PRIMARY KEY,
+      lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('open','gone')),
+      incident_key TEXT NOT NULL UNIQUE,
+      kanban_task_id TEXT,
+      latest_applied_at TEXT NOT NULL,
+      latest_applied_event_id TEXT NOT NULL REFERENCES watchdog_events(event_id),
+      latest_applied_digest TEXT NOT NULL,
+      recurrence_root_event_id TEXT REFERENCES watchdog_events(event_id),
+      recurrence_version INTEGER NOT NULL DEFAULT 0
+    )
+
+The state row is the sole ordering and one-open-incident authority for a key. `latest_applied_at`, `latest_applied_event_id`, and `latest_applied_digest` record the last state-changing transition, not merely receipt. `recurrence_root_event_id` identifies the first incident event in the task lineage and `recurrence_version` increments only when a gone lineage becomes active again.
+
+Within one `BEGIN IMMEDIATE` transaction: insert an event in `accepted` state; read and compare every affected incident-state row; derive transitions; insert pending deliveries; and insert/update every state row whose transition changes lifecycle or recovery marker. The transaction rejects same-time/different-digest conflicts and records stale events without modifying state rows. Commit before any Kanban action. Only then may the worker submit Kanban actions. A duplicate full digest is a successful no-op and resumes any pending/failed deliveries. A crash between journal commit and submission is recovered by selecting pending/failed deliveries. A crash after Kanban submission but before journal acknowledgement is recovered by querying/creating with the deterministic incident idempotency key, then recording the task ID. The implementation must not mark `submitted` until task ID is known and the journal update commits. The task ID write and delivery acknowledgement are atomic in a subsequent `BEGIN IMMEDIATE` transaction; retries may only reuse that row's deterministic incident key.
 
 ## Transition semantics
 
@@ -137,17 +152,20 @@ Process all keys in sorted order. An event can contain mixed transitions.
 
 | Condition per stable key | Transition | Required effect |
 |---|---|---|
-| key in `new_keys`, no open incident | NEW | create or wake one incident via its stable idempotency key |
-| key active, not new, already open | unchanged-active | record event linkage; no duplicate task or alert |
-| key in `gone_keys` with known incident | GONE / RESOLVIDO | append bounded resolution context and wake/update matching card; never auto-close it |
+| key in `new_keys`, no state row or gone state row | NEW | create or wake one incident via its stable idempotency key; set state `open`, advance latest-applied marker; if previously gone, this is recurrence and increments recurrence version |
+| key in `new_keys`, already open | duplicate-NEW | no task or alert; record delivery as no-op and do not advance latest-applied marker |
+| key active, not new, already open | unchanged-active | record event linkage; no duplicate task or alert; do not advance latest-applied marker |
+| key active, not new, with no state row | recovered-active | create/wake one incident with deterministic key, set `open`, and advance latest-applied marker; delivery records diagnostic `active_without_known_incident` |
+| key in `gone_keys` with open incident | GONE / RESOLVIDO | append bounded resolution context and wake/update matching card; never auto-close it; set state `gone` and advance latest-applied marker |
+| key in `gone_keys` with gone incident | duplicate-GONE | durable no-op, no task action, and do not advance latest-applied marker |
 | gone key with no known incident | gone-orphan | durable no-op plus diagnostic code; no task creation |
 | no keys changed | heartbeat-only | persist event; no Kanban task action |
-| key active after a prior gone incident | recurrence | reopen the previous task when transport supports it and policy permits; otherwise create one explicitly linked recurrence task |
+| key active after a prior gone incident | recurrence | process only if newer than the gone marker; reopen the previous task when transport supports it and policy permits, otherwise create one explicitly linked recurrence task; set `open`, increment recurrence version, and advance latest-applied marker |
 | duplicate event identity | duplicate | no-op except unfinished delivery recovery |
 | event older than the most recent applied event for a key | stale | persist as stale; no state/task mutation |
 | same timestamp but distinct full digest for a key | out-of-order conflict | persist and fail delivery for manual review; do not guess ordering |
 
-At all times, a stable key has at most one open incident. A GONE event never closes a card automatically. `daily` supplies the full active snapshot, and `check` supplies transition collections. For `daily`, keys removed from the previous accepted active snapshot become derived GONE transitions only when the event is newer than the prior snapshot; keys added become derived NEW transitions.
+At all times, a stable key has at most one open incident. A GONE event never closes a card automatically. `daily` supplies the full active snapshot, and `check` supplies explicit transition collections. For `daily`, after the snapshot passes per-key ordering, keys removed from the prior accepted daily snapshot derive GONE and keys added derive NEW; only the explicit `active_keys: []` can derive removal of all prior keys. The latest accepted daily snapshot is replaced atomically with the event/state update. Recurrence ordering is therefore: stale/identical events are no-ops, a newer GONE sets `gone`, and only a later NEW or derived-added key may increment recurrence. Same-time distinct digests remain conflicts rather than recurrence guesses.
 
 ## Board and assignee resolution
 
@@ -168,4 +186,5 @@ No profile configuration was modified by this contract task. If a later implemen
 - order and duplicate variation in key collections yields the same canonical collection and identity;
 - text variation changes event ID but not the stable incident idempotency key;
 - duplicate delivery and simulated crash after journal commit resume without a second card;
+- a daily payload without `active_keys` rejects before journal write, while a daily payload with explicit `"active_keys": []` is accepted and derives GONE only from a newer prior daily snapshot; supplied `new_keys` or `gone_keys` on daily reject;
 - NEW, unchanged, GONE, mixed, heartbeat, recurrence, stale, and out-of-order cases execute the effects listed above.
