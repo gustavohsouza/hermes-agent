@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "mode": "check",
+  "observed_at": "2026-09-09T17:05:33.139815-03:00",
+  "message": "ATENCAO: exemplo de mensagem Watchdog; conteúdo deve permanecer opaco.",
+  "active_keys": [
+    "cron-falhando",
+    "jobs-mortos",
+    "links-parados",
+    "proxy-erros"
+  ],
+  "new_keys": [
+    "proxy-erros"
+  ],
+  "gone_keys": [],
+  "text": {
+    "summary": "Exemplo de snapshot para teste de serialização.",
+    "new": {
+      "proxy-erros": "Erros do proxy Azure detectados."
+    },
+    "gone": {}
+  },
+  "diagnostics": {
+    "source": "watchdog.sh",
+    "exit_code": 0,
+    "collector": "watchdog"
+  }
+}
