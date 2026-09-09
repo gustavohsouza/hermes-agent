@@ -89,6 +89,18 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(journal.incident_task_id("jobs-mortos"), "t_122")
             self.assertEqual(journal.incident_task_id("proxy-erros"), "t_123")
 
+    def test_task_id_survives_gone_and_recurrence_after_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.sqlite3"; journal = Journal(path)
+            opened = journal.accept(check("2026-09-09T10:00:00Z", ["x"], ["x"]))
+            journal.acknowledge(opened.event_id, "x", "NEW", "t_123")
+            journal.accept(check("2026-09-09T11:00:00Z", [], [], ["x"]))
+            journal.close(); journal = Journal(path)
+            self.assertEqual(journal.incident_task_id("x"), "t_123")
+            journal.accept(check("2026-09-09T12:00:00Z", ["x"]))
+            self.assertEqual(journal.incident_task_id("x"), "t_123")
+            self.assertIn(("x", "RECURRENCE", "pending", "recurrence"), self.outcomes(journal))
+
     def test_acknowledgement_fails_closed_when_incident_has_other_task_id(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Journal(Path(directory) / "journal.sqlite3")
