@@ -177,6 +177,13 @@ class Journal:
         CREATE TABLE IF NOT EXISTS watchdog_incident_state (stable_key TEXT PRIMARY KEY, lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('open','gone')), incident_key TEXT NOT NULL UNIQUE, kanban_task_id TEXT, latest_applied_at TEXT NOT NULL, latest_applied_event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), latest_applied_digest TEXT NOT NULL, recurrence_root_event_id TEXT REFERENCES watchdog_events(event_id), recurrence_version INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS watchdog_daily_snapshot (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), observed_at TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), full_digest TEXT NOT NULL, active_keys_json TEXT NOT NULL);
         """)
+        delivery_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(watchdog_incident_deliveries)")
+        }
+        if "outcome_code" not in delivery_columns:
+            self.connection.execute(
+                "ALTER TABLE watchdog_incident_deliveries ADD COLUMN outcome_code TEXT"
+            )
         self.connection.commit()
 
     def _insert_event(self, event: CanonicalEvent) -> None:
@@ -252,13 +259,38 @@ class Journal:
         if not task_id: raise IntakeError("invalid_task_id")
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.connection.execute("UPDATE watchdog_incident_deliveries SET kanban_task_id=?,delivery_state='submitted' WHERE event_id=? AND stable_key=? AND transition=?", (task_id, event_id, stable_key, transition)).rowcount != 1: raise IntakeError("unknown_delivery")
+            delivery = self.connection.execute(
+                "SELECT kanban_task_id FROM watchdog_incident_deliveries WHERE event_id=? AND stable_key=? AND transition=?",
+                (event_id, stable_key, transition),
+            ).fetchone()
+            if delivery is None: raise IntakeError("unknown_delivery")
+            if delivery[0] not in (None, task_id): raise IntakeError("delivery_task_id_conflict")
+            incident = self.connection.execute(
+                "SELECT kanban_task_id FROM watchdog_incident_state WHERE stable_key=?", (stable_key,)
+            ).fetchone()
+            if incident is None: raise IntakeError("unknown_incident_state")
+            if incident[0] not in (None, task_id): raise IntakeError("incident_task_id_conflict")
+            if incident[0] is None:
+                self.connection.execute(
+                    "UPDATE watchdog_incident_state SET kanban_task_id=? WHERE stable_key=?",
+                    (task_id, stable_key),
+                )
+            self.connection.execute(
+                "UPDATE watchdog_incident_deliveries SET kanban_task_id=?,delivery_state='submitted' WHERE event_id=? AND stable_key=? AND transition=?",
+                (task_id, event_id, stable_key, transition),
+            )
             self.connection.commit()
         except Exception:
             self.connection.rollback(); raise
 
     def task_id(self, event_id: str, stable_key: str, transition: str) -> str | None:
         row = self.connection.execute("SELECT kanban_task_id FROM watchdog_incident_deliveries WHERE event_id=? AND stable_key=? AND transition=?", (event_id, stable_key, transition)).fetchone()
+        return row[0] if row else None
+
+    def incident_task_id(self, stable_key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT kanban_task_id FROM watchdog_incident_state WHERE stable_key=?", (stable_key,)
+        ).fetchone()
         return row[0] if row else None
 
     def event_count(self) -> int: return int(self.connection.execute("SELECT COUNT(*) FROM watchdog_events").fetchone()[0])

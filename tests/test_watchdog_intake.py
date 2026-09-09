@@ -86,6 +86,39 @@ class JournalTests(unittest.TestCase):
             journal.acknowledge(accepted.event_id, "proxy-erros", "NEW", "t_123"); journal.close(); journal = Journal(path)
             self.assertEqual(journal.pending_deliveries(), [])
             self.assertEqual(journal.task_id(accepted.event_id, "proxy-erros", "NEW"), "t_123")
+            self.assertEqual(journal.incident_task_id("jobs-mortos"), "t_122")
+            self.assertEqual(journal.incident_task_id("proxy-erros"), "t_123")
+
+    def test_acknowledgement_fails_closed_when_incident_has_other_task_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / "journal.sqlite3")
+            accepted = journal.accept(check("2026-09-09T10:00:00Z", ["x"], ["x"]))
+            journal.connection.execute("UPDATE watchdog_incident_state SET kanban_task_id='t_existing' WHERE stable_key='x'")
+            journal.connection.commit()
+            with self.assertRaisesRegex(IntakeError, "incident_task_id_conflict"):
+                journal.acknowledge(accepted.event_id, "x", "NEW", "t_new")
+            self.assertEqual(journal.task_id(accepted.event_id, "x", "NEW"), None)
+            self.assertEqual(journal.incident_task_id("x"), "t_existing")
+
+    def test_migrates_prior_journal_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            connection = __import__("sqlite3").connect(path)
+            connection.executescript("""
+            CREATE TABLE watchdog_events (event_id TEXT PRIMARY KEY, full_digest TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, received_at TEXT NOT NULL, state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, submitted_at TEXT);
+            CREATE TABLE watchdog_incident_deliveries (event_id TEXT NOT NULL, stable_key TEXT NOT NULL, transition TEXT NOT NULL, incident_key TEXT NOT NULL, kanban_task_id TEXT, delivery_state TEXT NOT NULL, PRIMARY KEY(event_id, stable_key, transition));
+            CREATE TABLE watchdog_incident_state (stable_key TEXT PRIMARY KEY, lifecycle_state TEXT NOT NULL, incident_key TEXT NOT NULL UNIQUE, kanban_task_id TEXT, latest_applied_at TEXT NOT NULL, latest_applied_event_id TEXT NOT NULL, latest_applied_digest TEXT NOT NULL, recurrence_root_event_id TEXT, recurrence_version INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO watchdog_events VALUES('old','digest','{}','2026-09-09T00:00:00Z','accepted',0,NULL,NULL);
+            INSERT INTO watchdog_incident_deliveries VALUES('old','x','NEW','incident',NULL,'pending');
+            INSERT INTO watchdog_incident_state VALUES('x','open','incident',NULL,'2026-09-09T00:00:00Z','old','digest','old',0);
+            """)
+            connection.commit(); connection.close()
+            journal = Journal(path)
+            self.assertEqual(journal.connection.execute("SELECT event_id FROM watchdog_events").fetchone(), ("old",))
+            self.assertEqual(journal.connection.execute("SELECT stable_key, outcome_code FROM watchdog_incident_deliveries").fetchone(), ("x", None))
+            self.assertEqual(journal.connection.execute("SELECT COUNT(*) FROM watchdog_daily_snapshot").fetchone(), (0,))
+            journal.close(); journal = Journal(path)
+            self.assertEqual(journal.connection.execute("SELECT COUNT(*) FROM watchdog_events").fetchone(), (1,))
 
     def test_check_transition_matrix_has_durable_outcomes(self):
         with tempfile.TemporaryDirectory() as directory:
