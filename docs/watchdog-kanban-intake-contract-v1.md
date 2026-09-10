@@ -19,11 +19,11 @@ The destination is the default shared Kanban DB at `~/.hermes/kanban.db`. Hermes
 The implementation accepts exactly one of:
 
 1. A structured in-process mapping supplied to the intake API.
-2. One UTF-8 JSON document supplied through standard input or an argv value that contains only serialized JSON.
+2. One UTF-8 JSON document supplied through standard input.
 
-A command-line wrapper must use a fixed executable path and fixed option names. It must never form a shell command from any event field, use `eval`, call a shell, or place event content in a command argument other than the single JSON payload passed directly to the process API. The preferred integration is stdin:
+A command-line wrapper must use a fixed executable path and fixed option names. It must never form a shell command from any event field, use `eval`, call a shell, or place event content in a command argument. The implemented integration is stdin:
 
-    watchdog-intake --json-stdin
+    ~/.hermes/bin/watchdog-kanban-intake
 
 The wrapper must read bounded bytes, decode strict UTF-8, parse one JSON object, and reject trailing non-whitespace content.
 
@@ -127,6 +127,7 @@ Persist accepted data in an intake-owned SQLite journal located beneath the impl
       incident_key TEXT NOT NULL,
       kanban_task_id TEXT,
       delivery_state TEXT NOT NULL CHECK(delivery_state IN ('pending','submitted','failed')),
+      outcome_code TEXT,
       PRIMARY KEY(event_id, stable_key, transition)
     )
 
@@ -172,7 +173,7 @@ At all times, a stable key has at most one open incident. A GONE event never clo
 The intake code resolves board and target through configuration/API calls, not alert text:
 
 1. Resolve the shared board using the normal Hermes resolution chain; the installed shared default is `~/.hermes/kanban.db`.
-2. Resolve the target assignee from `kanban.orchestrator_profile`, currently `foreman`; reject an empty/nonexistent profile.
+2. Use the bridge's fixed `foreman` assignee; the current runtime does not read `kanban.orchestrator_profile`.
 3. Call the Kanban API with structured title/body/idempotency fields. Do not invoke `hermes kanban` through a shell.
 
 No profile configuration was modified by this contract task. If a later implementation changes a live profile/config file, it must first copy a timestamped backup into its task workspace.
@@ -186,18 +187,31 @@ No profile configuration was modified by this contract task. If a later implemen
 
 After `Journal.accept(event)`, construct the adapter with the configured `foreman` assignee and call `submit_pending()`. The adapter reads only durable `pending` or `failed` delivery rows. It maps `NEW` and recovered-active transitions to `create_or_update` with the stable incident key, `GONE` to a waking `update` with `reopen=False`, and recurrence to a waking reopen or a new card with `linked_incident_task_id` metadata. Heartbeats and unchanged-active rows have no pending board operation.
 
-Install by placing this source package in the fixed application deployment, then configure the application-owned journal path (for example, `~/.hermes/state/watchdog-intake.sqlite3`) and inject the normal Hermes shared-board API as the `KanbanPort`. Do not store the journal in `watchdog-state.json`; its retention is operationally owned by the deployment. Before changing a live profile or launcher, copy it to a timestamped backup in the task workspace. To roll back, stop invoking `submit_pending()` and restore that backup; do not delete the journal or board cards, because retained pending deliveries are the recovery record. Re-enable the adapter later against the same journal to resume safely.
+Install the reviewed source with `watchdog_install.py` as described below. Do not
+store the journal in `watchdog-state.json`; the concrete runtime always uses
+`~/.hermes/state/watchdog-intake.sqlite3`. Retention is operationally owned by the
+deployment. The installer, not an operator-authored copy command, creates
+timestamped backups of replaced bridge files. To roll back, stop the producer hook
+and restore that backup; do not delete the journal or board cards, because retained
+pending deliveries are the recovery record. Re-enable the adapter later against
+the same journal to resume safely.
 
-Example integration is in-process and does not use interpolation:
+Example integration is in-process and does not use interpolation or placeholders:
 
-    journal = Journal(configured_journal_path)
-    journal.accept(structured_watchdog_event)
-    KanbanSubmissionAdapter(journal, configured_hermes_kanban_port).submit_pending()
+    from pathlib import Path
+    from watchdog_runtime import submit_watchdog_event
+
+    failures = submit_watchdog_event(
+        structured_watchdog_event,
+        Path.home() / ".hermes/state/watchdog-intake.sqlite3",
+    )
+    if failures:
+        raise RuntimeError("watchdog_kanban_submission_failed")
 
 ### Default-profile installation, activation, retention, and rollback
 
 The deployable bridge comprises `watchdog_boundary.py`, `watchdog_kanban.py`, and
-`watchdog_runtime.py`. Run `python3 watchdog_install.py` from a reviewed checkout
+`watchdog_runtime.py`. Run `python3 watchdog_install.py --profile "$HOME/.hermes" --source "$PWD"` from a reviewed checkout
 to copy those modules into the fixed `~/.hermes/lib/watchdog-bridge/` deployment
 and create the owner-only `~/.hermes/bin/watchdog-kanban-intake` launcher. The
 installer backs up every replaced deployed module or launcher beneath
@@ -210,14 +224,15 @@ concrete `HermesKanbanPort`, which calls `hermes_cli.kanban_db_connect.connect_c
 `create_task`, `get_task`, `reopen_review_task`, and `add_comment` directly. No
 `hermes kanban` subprocess or shell interpolation is involved.
 
-Install with `python3 watchdog_install.py`, then invoke the installed launcher only
+Install with the exact command above, then invoke the installed launcher only
 from an application-owned Watchdog hook after it has constructed and validated the
 structured event. If a different default-profile launcher or `~/.hermes/config.yaml`
 must change, copy that file to a timestamped backup before editing it. Configure the
-hook to pipe the one JSON object directly to
-`~/.hermes/bin/watchdog-kanban-intake`; never interpolate fields into a command
-string. The port resolves the normal configured shared board and sends created cards
-to the constant `foreman` assignee.
+hook to start `~/.hermes/bin/watchdog-kanban-intake` with a fixed argument array and
+write the one encoded JSON object to the process's standard input, as shown in the
+operator runbook; never interpolate fields into a command string. The port resolves
+the normal configured shared board and sends created cards to the constant `foreman`
+assignee.
 
 `Journal` creates or repairs the state directory at mode `0700` and its SQLite
 file plus extant WAL/SHM sidecars at `0600`; it raises `insecure_journal_permissions`
@@ -228,6 +243,11 @@ of intake or rollback. To roll back, disable only the Watchdog hook, restore the
 timestamped launcher/config backup, and retain the journal and existing board
 cards. Re-enable the same fixed command against the same journal to replay
 retained pending or failed deliveries safely.
+
+The executable activation, verification, WAL-aware backup, retention, and rollback
+procedure is `watchdog-bridge-operations.md`. Installation does not edit or enable
+the producer hook. The installed runtime deliberately creates a linked recurrence
+card instead of reopening the prior card, preserving `linked_incident_task_id`.
 
 Downstream callers may invoke the integration directly without shell interpolation:
 
