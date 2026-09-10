@@ -196,7 +196,13 @@ Example integration is in-process and does not use interpolation:
 
 ### Default-profile installation, activation, retention, and rollback
 
-The deployable bridge is `watchdog_runtime.py`. It exposes the fixed stdin command
+The deployable bridge comprises `watchdog_boundary.py`, `watchdog_kanban.py`, and
+`watchdog_runtime.py`. Run `python3 watchdog_install.py` from a reviewed checkout
+to copy those modules into the fixed `~/.hermes/lib/watchdog-bridge/` deployment
+and create the owner-only `~/.hermes/bin/watchdog-kanban-intake` launcher. The
+installer backs up every replaced deployed module or launcher beneath
+`~/.hermes/backups/watchdog-bridge/<UTC timestamp>/` before overwriting it. The
+launcher exposes only a JSON stdin interface and invokes
 `python -m watchdog_runtime --json-stdin`; it accepts no event-derived command
 arguments and passes the decoded mapping only to `submit_watchdog_event()`. That
 function persists at `~/.hermes/state/watchdog-intake.sqlite3`, then invokes the
@@ -204,14 +210,14 @@ concrete `HermesKanbanPort`, which calls `hermes_cli.kanban_db_connect.connect_c
 `create_task`, `get_task`, `reopen_review_task`, and `add_comment` directly. No
 `hermes kanban` subprocess or shell interpolation is involved.
 
-Install the source package into the fixed application deployment and invoke the
-entrypoint only from an application-owned Watchdog hook after it has constructed
-and validated the structured event. Before changing a default-profile launcher or
-`~/.hermes/config.yaml`, copy that changed file to `backups/<basename>.<UTC timestamp>`
-in the deployment task workspace. Then configure the hook to pipe the one JSON
-object directly to `python -m watchdog_runtime --json-stdin`; never interpolate
-fields into a command string. The port resolves the normal configured shared board
-and sends created cards to the constant `foreman` assignee.
+Install with `python3 watchdog_install.py`, then invoke the installed launcher only
+from an application-owned Watchdog hook after it has constructed and validated the
+structured event. If a different default-profile launcher or `~/.hermes/config.yaml`
+must change, copy that file to a timestamped backup before editing it. Configure the
+hook to pipe the one JSON object directly to
+`~/.hermes/bin/watchdog-kanban-intake`; never interpolate fields into a command
+string. The port resolves the normal configured shared board and sends created cards
+to the constant `foreman` assignee.
 
 `Journal` creates or repairs the state directory at mode `0700` and its SQLite
 file plus extant WAL/SHM sidecars at `0600`; it raises `insecure_journal_permissions`

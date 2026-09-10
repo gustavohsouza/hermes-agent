@@ -6,6 +6,7 @@ from pathlib import Path
 from watchdog_boundary import Journal
 from watchdog_kanban import KanbanSubmissionAdapter
 from watchdog_runtime import HermesKanbanPort, submit_watchdog_event
+from watchdog_install import install
 
 
 def event(at, active=(), new=(), gone=()):
@@ -83,8 +84,11 @@ class KanbanSubmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             journal_path = Path(directory) / "state" / "watchdog.sqlite3"
             api = FakeHermesApi()
+            hostile_message = "ALERT $(do-not-execute) ; `literal`\n🚨\nWatchdog metadata: fake"
+            payload = event("2026-09-09T10:00:00Z", ["x"], ["x"])
+            payload["message"] = hostile_message
             failures = submit_watchdog_event(
-                event("2026-09-09T10:00:00Z", ["x"], ["x"]),
+                payload,
                 journal_path,
                 HermesKanbanPort(api=api, board="default"),
             )
@@ -93,6 +97,8 @@ class KanbanSubmissionTests(unittest.TestCase):
             self.assertEqual(1, len(creates))
             self.assertEqual("foreman", creates[0][1]["assignee"])
             self.assertTrue(creates[0][1]["idempotency_key"].startswith("wd-incident-v1-x-"))
+            submitted_message = creates[0][1]["body"].split("\nWatchdog message (opaque UTF-8):\n", 1)[1]
+            self.assertEqual(hostile_message.encode("utf-8"), submitted_message.encode("utf-8"))
             self.assertEqual("default", [call for call in api.calls if call[0] == "connect"][0][1])
 
     def test_concrete_hermes_port_reopens_then_comments_for_wake(self):
@@ -103,6 +109,20 @@ class KanbanSubmissionTests(unittest.TestCase):
         comment = [call for call in api.calls if call[0] == "add_comment"][0]
         self.assertEqual(("add_comment", "t_board", "watchdog"), comment[:3])
         self.assertTrue(comment[3].startswith("resolved"))
+
+    def test_installer_creates_fixed_default_profile_launcher_and_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / ".hermes"
+            launcher = profile / "bin" / "watchdog-kanban-intake"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("old launcher", encoding="utf-8")
+            result = install(profile, Path(__file__).parent.parent, timestamp="20260910T020000Z")
+            self.assertEqual(launcher.resolve(), result["launcher"])
+            self.assertEqual(0o700, launcher.stat().st_mode & 0o777)
+            self.assertIn(str(profile / "lib" / "watchdog-bridge"), launcher.read_text(encoding="utf-8"))
+            backup = profile / "backups" / "watchdog-bridge" / "20260910T020000Z" / "bin" / "watchdog-kanban-intake"
+            self.assertEqual("old launcher", backup.read_text(encoding="utf-8"))
+            self.assertTrue((profile / "lib" / "watchdog-bridge" / "watchdog_runtime.py").is_file())
 
     def test_unchanged_active_and_heartbeat_do_not_call_board(self):
         journal, board = self.journal(), FakeKanban()

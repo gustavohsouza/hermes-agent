@@ -37,7 +37,14 @@ class KanbanSubmissionAdapter:
         payload = detail["payload"]
         title = f"Watchdog incident: {stable_key}"
         context = payload.get("text", {}).get("gone" if transition == "GONE" else "new", {}).get(stable_key, "")
-        body = f"Watchdog transition: {transition}\nStable key: {stable_key}\n{context}".rstrip()
+        message = payload["message"]
+        body = (
+            f"Watchdog transition: {transition}\n"
+            f"Stable key: {stable_key}\n"
+            f"{context}\n"
+            "Watchdog message (opaque UTF-8):\n"
+            f"{message}"
+        )
         metadata = {"watchdog_event_id": event_id, "stable_key": stable_key,
                     "transition": transition, "recurrence_version": detail["recurrence_version"]}
         prior_task_id = detail["incident_task_id"]
