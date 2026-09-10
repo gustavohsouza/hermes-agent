@@ -165,8 +165,23 @@ def read_json_stdin(stream: BinaryIO) -> dict[str, Any]:
 class Journal:
     """SQLite journal whose delivery rows are the only downstream work queue."""
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True); self.connection = sqlite3.connect(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._secure_path(path.parent, 0o700)
+        self.connection = sqlite3.connect(path)
+        self._secure_path(path, 0o600)
         self.connection.execute("PRAGMA foreign_keys = ON"); self.connection.execute("PRAGMA journal_mode = WAL"); self._create_schema()
+        for sidecar in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+            if sidecar.exists():
+                self._secure_path(sidecar, 0o600)
+
+    @staticmethod
+    def _secure_path(path: Path, mode: int) -> None:
+        try:
+            path.chmod(mode)
+        except OSError as exc:
+            raise IntakeError("insecure_journal_permissions") from exc
+        if path.stat().st_mode & 0o777 != mode:
+            raise IntakeError("insecure_journal_permissions")
 
     def close(self) -> None: self.connection.close()
 

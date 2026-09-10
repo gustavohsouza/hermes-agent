@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from watchdog_boundary import Journal
 from watchdog_kanban import KanbanSubmissionAdapter
+from watchdog_runtime import HermesKanbanPort, submit_watchdog_event
 
 
 def event(at, active=(), new=(), gone=()):
@@ -30,6 +32,37 @@ class FakeKanban:
         return task_id
 
 
+class FakeHermesApi:
+    def __init__(self):
+        self.calls = []
+        self.task = type("Task", (), {"status": "review"})()
+
+    @contextmanager
+    def connect_closing(self, *, board=None):
+        self.calls.append(("connect", board))
+        yield object()
+
+    def create_task(self, connection, **kwargs):
+        self.calls.append(("create_task", kwargs))
+        return "t_board"
+
+    def get_task(self, connection, task_id):
+        self.calls.append(("get_task", task_id))
+        return self.task
+
+    def reopen_review_task(self, connection, task_id):
+        self.calls.append(("reopen_review_task", task_id))
+        return True
+
+    def unblock_task(self, connection, task_id):
+        self.calls.append(("unblock_task", task_id))
+        return True
+
+    def add_comment(self, connection, task_id, author, body):
+        self.calls.append(("add_comment", task_id, author, body))
+        return 1
+
+
 class KanbanSubmissionTests(unittest.TestCase):
     def journal(self):
         directory = tempfile.TemporaryDirectory()
@@ -45,6 +78,31 @@ class KanbanSubmissionTests(unittest.TestCase):
         self.assertEqual("foreman", call[3])
         self.assertIn("wd-incident-v1-proxy-erros-", call[4])
         self.assertEqual([], journal.pending_deliveries())
+
+    def test_concrete_hermes_port_submits_persisted_event_without_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal_path = Path(directory) / "state" / "watchdog.sqlite3"
+            api = FakeHermesApi()
+            failures = submit_watchdog_event(
+                event("2026-09-09T10:00:00Z", ["x"], ["x"]),
+                journal_path,
+                HermesKanbanPort(api=api, board="default"),
+            )
+            self.assertEqual(0, failures)
+            creates = [call for call in api.calls if call[0] == "create_task"]
+            self.assertEqual(1, len(creates))
+            self.assertEqual("foreman", creates[0][1]["assignee"])
+            self.assertTrue(creates[0][1]["idempotency_key"].startswith("wd-incident-v1-x-"))
+            self.assertEqual("default", [call for call in api.calls if call[0] == "connect"][0][1])
+
+    def test_concrete_hermes_port_reopens_then_comments_for_wake(self):
+        api = FakeHermesApi()
+        port = HermesKanbanPort(api=api, board="default")
+        self.assertEqual("t_board", port.update(task_id="t_board", body="resolved", wake=True, reopen=True))
+        self.assertIn(("reopen_review_task", "t_board"), api.calls)
+        comment = [call for call in api.calls if call[0] == "add_comment"][0]
+        self.assertEqual(("add_comment", "t_board", "watchdog"), comment[:3])
+        self.assertTrue(comment[3].startswith("resolved"))
 
     def test_unchanged_active_and_heartbeat_do_not_call_board(self):
         journal, board = self.journal(), FakeKanban()

@@ -196,21 +196,36 @@ Example integration is in-process and does not use interpolation:
 
 ### Default-profile installation, activation, retention, and rollback
 
-The source package is deployed with the application; the default profile is only a configuration consumer. Install it by creating `~/.hermes/state/` with mode `0700`, configuring the application to create `~/.hermes/state/watchdog-intake.sqlite3` and its WAL/SHM companions owner-readable and owner-writable only, and injecting the default-board `KanbanPort` plus the configured `foreman` profile. Do not copy event data into YAML, environment variables, command strings, or a `hermes kanban` subprocess.
+The deployable bridge is `watchdog_runtime.py`. It exposes the fixed stdin command
+`python -m watchdog_runtime --json-stdin`; it accepts no event-derived command
+arguments and passes the decoded mapping only to `submit_watchdog_event()`. That
+function persists at `~/.hermes/state/watchdog-intake.sqlite3`, then invokes the
+concrete `HermesKanbanPort`, which calls `hermes_cli.kanban_db_connect.connect_closing`,
+`create_task`, `get_task`, `reopen_review_task`, and `add_comment` directly. No
+`hermes kanban` subprocess or shell interpolation is involved.
 
-Before changing a default-profile launcher or `~/.hermes/config.yaml`, make a timestamped backup in the task workspace, for example `backups/config.yaml.<UTC timestamp>` or `backups/watchdog-launcher.<UTC timestamp>`. Activation means enabling the in-process sequence `Journal.accept(event)` followed by `KanbanSubmissionAdapter(...).submit_pending()` after each validated Watchdog event. The integration must use the existing configured default board, not a board name supplied by an event.
+Install the source package into the fixed application deployment and invoke the
+entrypoint only from an application-owned Watchdog hook after it has constructed
+and validated the structured event. Before changing a default-profile launcher or
+`~/.hermes/config.yaml`, copy that changed file to `backups/<basename>.<UTC timestamp>`
+in the deployment task workspace. Then configure the hook to pipe the one JSON
+object directly to `python -m watchdog_runtime --json-stdin`; never interpolate
+fields into a command string. The port resolves the normal configured shared board
+and sends created cards to the constant `foreman` assignee.
 
-There is deliberately no automatic deletion policy in v1. Retain the SQLite journal and its WAL/SHM companions until an operator has verified that `pending_deliveries()` is empty and has preserved an offline SQLite backup. Cleanup must be an explicit maintenance operation, never part of intake, submission, or rollback. To roll back, disable only the activation hook, restore the timestamped launcher/config backup, and keep the journal and existing board cards intact. Re-activate against the same journal to replay retained pending or failed deliveries safely.
+`Journal` creates or repairs the state directory at mode `0700` and its SQLite
+file plus extant WAL/SHM sidecars at `0600`; it raises `insecure_journal_permissions`
+if it cannot establish those modes. Retain the journal and its WAL/SHM companions
+until an operator has verified `pending_deliveries()` is empty and preserved an
+offline SQLite backup. Cleanup is an explicit maintenance operation, never part
+of intake or rollback. To roll back, disable only the Watchdog hook, restore the
+timestamped launcher/config backup, and retain the journal and existing board
+cards. Re-enable the same fixed command against the same journal to replay
+retained pending or failed deliveries safely.
 
-Downstream callers pass data directly, without shell interpolation:
+Downstream callers may invoke the integration directly without shell interpolation:
 
-    def submit_watchdog_event(event: dict[str, object], journal_path, kanban_port) -> int:
-        journal = Journal(journal_path)
-        try:
-            journal.accept(event)
-            return KanbanSubmissionAdapter(journal, kanban_port, assignee="foreman").submit_pending()
-        finally:
-            journal.close()
+    submit_watchdog_event(event, Path.home() / ".hermes/state/watchdog-intake.sqlite3")
 
 ## Acceptance tests required of the implementation cards
 

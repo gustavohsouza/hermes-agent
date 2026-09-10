@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,22 @@ class CanonicalizationTests(unittest.TestCase):
 
 
 class JournalTests(unittest.TestCase):
+    def test_journal_enforces_owner_only_storage_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o755)
+            os.chmod(state, 0o755)
+            path = state / "journal.sqlite3"
+            path.touch(mode=0o644)
+            os.chmod(path, 0o644)
+            journal = Journal(path)
+            self.addCleanup(journal.close)
+            self.assertEqual(0o700, state.stat().st_mode & 0o777)
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            for sidecar in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+                if sidecar.exists():
+                    self.assertEqual(0o600, sidecar.stat().st_mode & 0o777)
+
     def outcomes(self, journal):
         return [tuple(row) for row in journal.connection.execute(
             "SELECT stable_key,transition,delivery_state,COALESCE(outcome_code,'') FROM watchdog_incident_deliveries ORDER BY event_id,stable_key,transition")]
