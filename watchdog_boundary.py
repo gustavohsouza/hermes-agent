@@ -255,7 +255,32 @@ class Journal:
     def pending_deliveries(self) -> list[tuple[str, str, str]]:
         return [tuple(row) for row in self.connection.execute("SELECT event_id,stable_key,transition FROM watchdog_incident_deliveries WHERE delivery_state IN ('pending','failed') ORDER BY event_id,stable_key,transition")]
 
-    def acknowledge(self, event_id: str, stable_key: str, transition: str, task_id: str) -> None:
+    def delivery_details(self, event_id: str, stable_key: str, transition: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT d.incident_key,d.kanban_task_id,d.outcome_code,s.kanban_task_id,s.recurrence_version,"
+            "e.payload_json FROM watchdog_incident_deliveries d JOIN watchdog_events e ON e.event_id=d.event_id "
+            "LEFT JOIN watchdog_incident_state s ON s.stable_key=d.stable_key "
+            "WHERE d.event_id=? AND d.stable_key=? AND d.transition=?",
+            (event_id, stable_key, transition),
+        ).fetchone()
+        if row is None:
+            raise IntakeError("unknown_delivery")
+        return {"incident_key": row[0], "delivery_task_id": row[1], "outcome_code": row[2],
+                "incident_task_id": row[3], "recurrence_version": row[4],
+                "payload": json.loads(row[5])}
+
+    def record_failure(self, event_id: str, stable_key: str, transition: str, code: str) -> None:
+        if not code or len(code) > 128:
+            raise IntakeError("invalid_failure_code")
+        with self.connection:
+            if self.connection.execute(
+                "UPDATE watchdog_incident_deliveries SET delivery_state='failed',outcome_code=? "
+                "WHERE event_id=? AND stable_key=? AND transition=?",
+                (code, event_id, stable_key, transition),
+            ).rowcount != 1:
+                raise IntakeError("unknown_delivery")
+
+    def acknowledge(self, event_id: str, stable_key: str, transition: str, task_id: str, *, replace_incident_task_id: bool = False) -> None:
         if not task_id: raise IntakeError("invalid_task_id")
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -269,8 +294,8 @@ class Journal:
                 "SELECT kanban_task_id FROM watchdog_incident_state WHERE stable_key=?", (stable_key,)
             ).fetchone()
             if incident is None: raise IntakeError("unknown_incident_state")
-            if incident[0] not in (None, task_id): raise IntakeError("incident_task_id_conflict")
-            if incident[0] is None:
+            if incident[0] not in (None, task_id) and not replace_incident_task_id: raise IntakeError("incident_task_id_conflict")
+            if incident[0] != task_id:
                 self.connection.execute(
                     "UPDATE watchdog_incident_state SET kanban_task_id=? WHERE stable_key=?",
                     (task_id, stable_key),

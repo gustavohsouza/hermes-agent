@@ -177,6 +177,23 @@ The intake code resolves board and target through configuration/API calls, not a
 
 No profile configuration was modified by this contract task. If a later implementation changes a live profile/config file, it must first copy a timestamped backup into its task workspace.
 
+## Submission adapter and operator procedure
+
+`watchdog_kanban.KanbanSubmissionAdapter` is the transport boundary. It accepts a `Journal` and a structured `KanbanPort`; it never calls a shell, builds a command, or derives a board, assignee, path, or query from event content. The port contract is:
+
+    create_or_update(title, body, assignee, idempotency_key, metadata) -> task_id
+    update(task_id, body, wake=False, reopen=False, metadata=None) -> task_id
+
+After `Journal.accept(event)`, construct the adapter with the configured `foreman` assignee and call `submit_pending()`. The adapter reads only durable `pending` or `failed` delivery rows. It maps `NEW` and recovered-active transitions to `create_or_update` with the stable incident key, `GONE` to a waking `update` with `reopen=False`, and recurrence to a waking reopen or a new card with `linked_incident_task_id` metadata. Heartbeats and unchanged-active rows have no pending board operation.
+
+Install by placing this source package in the fixed application deployment, then configure the application-owned journal path (for example, `~/.hermes/state/watchdog-intake.sqlite3`) and inject the normal Hermes shared-board API as the `KanbanPort`. Do not store the journal in `watchdog-state.json`; its retention is operationally owned by the deployment. Before changing a live profile or launcher, copy it to a timestamped backup in the task workspace. To roll back, stop invoking `submit_pending()` and restore that backup; do not delete the journal or board cards, because retained pending deliveries are the recovery record. Re-enable the adapter later against the same journal to resume safely.
+
+Example integration is in-process and does not use interpolation:
+
+    journal = Journal(configured_journal_path)
+    journal.accept(structured_watchdog_event)
+    KanbanSubmissionAdapter(journal, configured_hermes_kanban_port).submit_pending()
+
 ## Acceptance tests required of the implementation cards
 
 - structured mapping and stdin JSON produce the same canonical payload and event ID;
