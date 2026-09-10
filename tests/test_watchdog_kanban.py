@@ -129,6 +129,39 @@ class KanbanSubmissionTests(unittest.TestCase):
         self.assertEqual(creates[0][4], creates[1][4])
         self.assertEqual("t_1", journal.task_id(accepted.event_id, "x", "NEW"))
 
+    def test_mixed_event_preserves_opaque_message_and_updates_each_incident_once(self):
+        journal, board = self.journal(), FakeKanban()
+        opened = journal.accept(event("2026-09-09T09:00:00Z", ["resolved"], ["resolved"]))
+        KanbanSubmissionAdapter(journal, board).submit_pending()
+        hostile_message = "ALERT $(do-not-execute) ; `literal`\n🚨"
+        mixed = event("2026-09-09T10:00:00Z", ["fresh", "stable"], ["fresh"], ["resolved"])
+        mixed["message"] = hostile_message
+        mixed["text"] = {
+            "new": {"fresh": "literal $(still-data)"},
+            "gone": {"resolved": "resolved $(still-data)"},
+        }
+        accepted = journal.accept(mixed)
+
+        self.assertEqual(
+            hostile_message.encode("utf-8"),
+            journal.delivery_details(accepted.event_id, "fresh", "NEW")["payload"]["message"].encode("utf-8"),
+        )
+        self.assertEqual(0, KanbanSubmissionAdapter(journal, board).submit_pending())
+        self.assertEqual([], journal.pending_deliveries())
+        creates = [call for call in board.calls if call[0] == "create"]
+        updates = [call for call in board.calls if call[0] == "update"]
+        self.assertEqual(3, len(creates))  # initial resolved, fresh NEW, stable recovered-active
+        self.assertEqual(1, len(updates))
+        self.assertEqual({"resolved", "fresh", "stable"}, {call[-1]["stable_key"] for call in creates})
+        self.assertEqual({opened.event_id, accepted.event_id}, {call[-1]["watchdog_event_id"] for call in creates})
+        self.assertEqual(("update", journal.task_id(opened.event_id, "resolved", "NEW")), updates[0][:2])
+        self.assertEqual(accepted.event_id, updates[0][-1]["watchdog_event_id"])
+        self.assertEqual("resolved", updates[0][-1]["stable_key"])
+        self.assertTrue(updates[0][3])
+        self.assertFalse(updates[0][4])
+        self.assertIn("literal $(still-data)", creates[-2][2])
+        self.assertIn("resolved $(still-data)", updates[0][2])
+
 
 if __name__ == "__main__":
     unittest.main()

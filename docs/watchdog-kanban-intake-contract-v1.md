@@ -194,6 +194,24 @@ Example integration is in-process and does not use interpolation:
     journal.accept(structured_watchdog_event)
     KanbanSubmissionAdapter(journal, configured_hermes_kanban_port).submit_pending()
 
+### Default-profile installation, activation, retention, and rollback
+
+The source package is deployed with the application; the default profile is only a configuration consumer. Install it by creating `~/.hermes/state/` with mode `0700`, configuring the application to create `~/.hermes/state/watchdog-intake.sqlite3` and its WAL/SHM companions owner-readable and owner-writable only, and injecting the default-board `KanbanPort` plus the configured `foreman` profile. Do not copy event data into YAML, environment variables, command strings, or a `hermes kanban` subprocess.
+
+Before changing a default-profile launcher or `~/.hermes/config.yaml`, make a timestamped backup in the task workspace, for example `backups/config.yaml.<UTC timestamp>` or `backups/watchdog-launcher.<UTC timestamp>`. Activation means enabling the in-process sequence `Journal.accept(event)` followed by `KanbanSubmissionAdapter(...).submit_pending()` after each validated Watchdog event. The integration must use the existing configured default board, not a board name supplied by an event.
+
+There is deliberately no automatic deletion policy in v1. Retain the SQLite journal and its WAL/SHM companions until an operator has verified that `pending_deliveries()` is empty and has preserved an offline SQLite backup. Cleanup must be an explicit maintenance operation, never part of intake, submission, or rollback. To roll back, disable only the activation hook, restore the timestamped launcher/config backup, and keep the journal and existing board cards intact. Re-activate against the same journal to replay retained pending or failed deliveries safely.
+
+Downstream callers pass data directly, without shell interpolation:
+
+    def submit_watchdog_event(event: dict[str, object], journal_path, kanban_port) -> int:
+        journal = Journal(journal_path)
+        try:
+            journal.accept(event)
+            return KanbanSubmissionAdapter(journal, kanban_port, assignee="foreman").submit_pending()
+        finally:
+            journal.close()
+
 ## Acceptance tests required of the implementation cards
 
 - structured mapping and stdin JSON produce the same canonical payload and event ID;
