@@ -2,10 +2,11 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from watchdog_boundary import Journal
 from watchdog_kanban import KanbanSubmissionAdapter
-from watchdog_runtime import HermesKanbanPort, submit_watchdog_event
+from watchdog_runtime import HermesKanbanPort, main, submit_watchdog_event
 from watchdog_install import install
 
 
@@ -101,6 +102,21 @@ class KanbanSubmissionTests(unittest.TestCase):
             self.assertEqual(hostile_message.encode("utf-8"), submitted_message.encode("utf-8"))
             self.assertEqual("default", [call for call in api.calls if call[0] == "connect"][0][1])
 
+    def test_concrete_create_retry_does_not_duplicate_board_comments(self):
+        api = FakeHermesApi()
+        port = HermesKanbanPort(api=api, board="default")
+        arguments = {
+            "title": "Watchdog incident: x",
+            "body": "opaque body",
+            "assignee": "foreman",
+            "idempotency_key": "wd-incident-v1-x-fixed",
+            "metadata": {"watchdog_event_id": "wd-v1-fixed"},
+        }
+        self.assertEqual("t_board", port.create_or_update(**arguments))
+        self.assertEqual("t_board", port.create_or_update(**arguments))
+        self.assertEqual(2, len([call for call in api.calls if call[0] == "create_task"]))
+        self.assertEqual([], [call for call in api.calls if call[0] == "add_comment"])
+
     def test_concrete_hermes_port_reopens_then_comments_for_wake(self):
         api = FakeHermesApi()
         port = HermesKanbanPort(api=api, board="default")
@@ -123,6 +139,28 @@ class KanbanSubmissionTests(unittest.TestCase):
             backup = profile / "backups" / "watchdog-bridge" / "20260910T020000Z" / "bin" / "watchdog-kanban-intake"
             self.assertEqual("old launcher", backup.read_text(encoding="utf-8"))
             self.assertTrue((profile / "lib" / "watchdog-bridge" / "watchdog_runtime.py").is_file())
+
+    def test_stdin_entrypoint_reopens_real_journal_across_invocations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            payload = event("2026-09-09T10:00:00Z", ["x"], ["x"])
+
+            def invoke():
+                encoded = __import__("json").dumps(payload).encode("utf-8")
+                stdin = type("Stdin", (), {"buffer": __import__("io").BytesIO(encoded)})()
+                with patch("watchdog_runtime.Path.home", return_value=home), \
+                     patch("watchdog_runtime.sys.stdin", stdin), \
+                     patch("watchdog_runtime.HermesKanbanPort", return_value=board):
+                    self.assertEqual(0, main(["--json-stdin"]))
+
+            board = FakeKanban()
+            invoke()
+            invoke()
+            self.assertEqual(1, len(board.created))
+            journal = Journal(home / ".hermes" / "state" / "watchdog-intake.sqlite3")
+            self.addCleanup(journal.close)
+            self.assertEqual(1, journal.event_count())
+            self.assertEqual([], journal.pending_deliveries())
 
     def test_unchanged_active_and_heartbeat_do_not_call_board(self):
         journal, board = self.journal(), FakeKanban()
@@ -174,18 +212,27 @@ class KanbanSubmissionTests(unittest.TestCase):
         self.assertEqual(1, len([call for call in board.calls if call[0] == "create"]))
         self.assertEqual("t_1", journal.task_id(accepted.event_id, "x", "NEW"))
 
-    def test_partial_failure_remains_durable_and_retries(self):
-        journal, board = self.journal(), FakeKanban(fail_create=True)
+    def test_partial_failure_remains_durable_across_restart_and_retries(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "journal.sqlite3"
+        journal, board = Journal(path), FakeKanban(fail_create=True)
         accepted = journal.accept(event("2026-09-09T10:00:00Z", ["x"], ["x"]))
         adapter = KanbanSubmissionAdapter(journal, board)
         self.assertEqual(1, adapter.submit_pending())
         self.assertEqual([(accepted.event_id, "x", "NEW")], journal.pending_deliveries())
+        journal.close()
+        journal = Journal(path)
         board.fail_create = False
-        self.assertEqual(0, adapter.submit_pending())
+        self.assertEqual(0, KanbanSubmissionAdapter(journal, board).submit_pending())
         self.assertEqual([], journal.pending_deliveries())
+        self.assertEqual(1, len(board.created))
 
-    def test_retry_after_board_success_before_acknowledgement_reuses_incident_key(self):
-        journal, board = self.journal(), FakeKanban()
+    def test_retry_after_board_success_before_acknowledgement_survives_restart(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "journal.sqlite3"
+        journal, board = Journal(path), FakeKanban()
         accepted = journal.accept(event("2026-09-09T10:00:00Z", ["x"], ["x"]))
         adapter = KanbanSubmissionAdapter(journal, board)
         acknowledge = journal.acknowledge
@@ -201,11 +248,33 @@ class KanbanSubmissionTests(unittest.TestCase):
         journal.acknowledge = crash_before_acknowledgement
         self.assertEqual(1, adapter.submit_pending())
         self.assertEqual([(accepted.event_id, "x", "NEW")], journal.pending_deliveries())
-        self.assertEqual(0, adapter.submit_pending())
+        journal.close()
+        journal = Journal(path)
+        self.assertEqual(0, KanbanSubmissionAdapter(journal, board).submit_pending())
         creates = [call for call in board.calls if call[0] == "create"]
         self.assertEqual(2, len(creates))
         self.assertEqual(creates[0][4], creates[1][4])
+        self.assertEqual(1, len(board.created))
         self.assertEqual("t_1", journal.task_id(accepted.event_id, "x", "NEW"))
+
+    def test_one_open_board_incident_per_key_across_lifecycle(self):
+        journal, board = self.journal(), FakeKanban()
+        adapter = KanbanSubmissionAdapter(journal, board, reopen_supported=True)
+        journal.accept(event("2026-09-09T10:00:00Z", ["x"], ["x"]))
+        adapter.submit_pending()
+        journal.accept(event("2026-09-09T11:00:00Z", ["x"], ["x"]))
+        adapter.submit_pending()
+        journal.accept(event("2026-09-09T12:00:00Z", gone=["x"]))
+        adapter.submit_pending()
+        journal.accept(event("2026-09-09T13:00:00Z", ["x"]))
+        adapter.submit_pending()
+        journal.accept(event("2026-09-09T14:00:00Z", ["x"], ["x"]))
+        adapter.submit_pending()
+
+        self.assertEqual(1, len(board.created))
+        self.assertEqual("t_1", journal.incident_task_id("x"))
+        self.assertEqual(1, len([call for call in board.calls if call[0] == "create"]))
+        self.assertEqual(2, len([call for call in board.calls if call[0] == "update"]))
 
     def test_mixed_event_preserves_opaque_message_and_updates_each_incident_once(self):
         journal, board = self.journal(), FakeKanban()

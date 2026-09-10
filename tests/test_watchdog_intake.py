@@ -26,6 +26,61 @@ def daily(at, active, message="snapshot"):
 
 
 class CanonicalizationTests(unittest.TestCase):
+    def test_all_documented_field_and_identity_boundaries(self):
+        at_limit = dict(
+            BASE,
+            message="m" * 16384,
+            active_keys=[f"k{i:03d}" for i in range(256)],
+            new_keys=[],
+            text={
+                "summary": "s" * 2048,
+                "new": {},
+                "gone": {},
+            },
+            diagnostics={
+                "source": "s" * 512,
+                "collector": "c" * 512,
+                "exit_code": 1,
+                "duration_ms": 2,
+            },
+        )
+        payload = canonicalize_event(at_limit).payload
+        self.assertEqual(16384, len(payload["message"].encode("utf-8")))
+        self.assertEqual(256, len(payload["active_keys"]))
+        self.assertEqual(2048, len(payload["text"]["summary"].encode("utf-8")))
+        self.assertEqual(512, len(payload["diagnostics"]["source"].encode("utf-8")))
+        maximum_key = "k" * 96
+        derived = incident_key(maximum_key)
+        self.assertEqual(136, len(derived.encode("ascii")))
+        self.assertIn(maximum_key, derived)
+
+        rejected = [
+            dict(BASE, message="m" * 16385),
+            dict(BASE, active_keys=[f"k{i:03d}" for i in range(257)], new_keys=[]),
+            dict(BASE, active_keys=["k" * 97], new_keys=[]),
+            dict(BASE, diagnostics={"source": "ok", "unknown": "no"}),
+        ]
+        for value in rejected:
+            with self.subTest(value=list(value)):
+                with self.assertRaises(IntakeError):
+                    canonicalize_event(value)
+
+        truncated = canonicalize_event(dict(
+            BASE,
+            text={
+                "summary": "s" * 2049,
+                "new": {"proxy-erros": "n" * 1025},
+            },
+            diagnostics={"source": "d" * 513},
+        )).payload
+        self.assertLessEqual(len(truncated["text"]["summary"].encode("utf-8")), 2048)
+        self.assertLessEqual(len(truncated["text"]["new"]["proxy-erros"].encode("utf-8")), 1024)
+        self.assertLessEqual(len(truncated["diagnostics"]["source"].encode("utf-8")), 512)
+        self.assertEqual(
+            ["diagnostics", "text_new", "text_summary"],
+            truncated["normalization"]["truncated_fields"],
+        )
+
     def test_unicode_message_round_trips_without_normalization(self):
         payload = canonicalize_event(BASE).payload
         self.assertEqual(payload["message"].encode("utf-8"), BASE["message"].encode("utf-8"))

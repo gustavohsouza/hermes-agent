@@ -40,7 +40,6 @@ class HermesKanbanPort:
                 created_by="watchdog",
                 idempotency_key=idempotency_key,
             )
-            self.api.add_comment(connection, task_id, "watchdog", _comment(body, metadata))
             return task_id
 
     def update(self, *, task_id: str, body: str, wake: bool = False,
