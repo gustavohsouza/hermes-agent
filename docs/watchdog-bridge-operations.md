@@ -25,7 +25,7 @@ The state directory is forced to `0700`; the database and extant WAL/SHM sidecar
 
 ## Activation boundary
 
-Installation alone does not activate the bridge. The current producer is `~/hermes/bin/watchdog.sh`; an operator must explicitly connect the producer's already-computed snapshot to the installed launcher. Do not pass human alert text as shell syntax, construct JSON with string concatenation, use `eval`, or use `shell=True`.
+Installation alone does not activate the bridge. The current producer is `~/hermes/bin/watchdog.sh`; an operator must explicitly connect the producer's already-computed snapshot to the installed launcher. Do not pass human alert text as shell syntax, construct JSON with string concatenation, or execute event data through a command interpreter.
 
 The safe downstream call is a process API with a fixed argv and encoded JSON on stdin:
 
