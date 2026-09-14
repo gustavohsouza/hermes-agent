@@ -1167,6 +1167,12 @@ DEFAULT_CONFIG = {
             "timeout": 60,  # seconds; allow self-hosted backends time to cold-start
             "max_retries": 1,  # OpenAI SDK transport retries
         },
+        "azure_foundry": {
+            # Existing Foundry v1 endpoint; credentials remain in the environment, never config.yaml.
+            # gpt-4o-mini-transcribe is the cost/quality default for recorded voice notes.
+            "model": "gpt-4o-mini-transcribe",
+            "language": "",  # set "pt" for Brazilian Portuguese voice notes
+        },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
             "language": "",  # auto-detect; set "en", "es", ... to force
