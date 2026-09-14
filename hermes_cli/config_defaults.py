@@ -1168,8 +1168,9 @@ DEFAULT_CONFIG = {
             "max_retries": 1,  # OpenAI SDK transport retries
         },
         "azure_foundry": {
-            # Existing Foundry v1 endpoint; credentials remain in the environment, never config.yaml.
-            # gpt-4o-mini-transcribe is the cost/quality default for recorded voice notes.
+            # Audio uses Azure's legacy per-deployment route with api-version=2024-06-01;
+            # the gus-foundry /openai/v1 surface returns DeploymentNotFound for audio.
+            # Credentials remain in the environment, never config.yaml.
             "model": "gpt-4o-mini-transcribe",
             "language": "",  # set "pt" for Brazilian Portuguese voice notes
         },
