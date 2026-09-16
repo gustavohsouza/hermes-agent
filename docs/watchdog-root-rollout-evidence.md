@@ -31,6 +31,21 @@ Audited on 2026-09-16 against commit `3f58a2e9a2d7c75fbc154eb78ef5c5c2ae08a85f` 
     python -m compileall -q watchdog_boundary.py watchdog_kanban.py watchdog_runtime.py watchdog_closure.py bin/watchdog_dispatch.py
     # no output, exit 0
 
-## Residual risk
+## Remediation deployment (2026-09-16)
+
+The reviewed bridge was redeployed with `python watchdog_install.py --profile /Users/gustavosouza/.hermes`. Repository and installed SHA-256 pairs now match:
+
+- `watchdog_boundary.py`: `356de36a85c297d24abdcb75bccc38b04730be9c86670b24fa9adc3a7657e5c7`
+- `watchdog_kanban.py`: `daca1b14f6a91b350739587ce9ad8b78cf5ab55bed9cdfe13f08a20f4ee80dfb`
+- `watchdog_runtime.py`: `e6377898ac4a906ec702842c5cbf03deee4071021ab42f478870aa9ba71124ac`
+- `watchdog_closure.py`: `099a7280d40a65eaf6130441aabb8d8d1be037e1681cbd480d8642207c5cd466`
+
+The focused command in Verification was rerun and reported `Ran 49 tests ... OK`. Read-only `launchctl print` reported 8 daily runs and 23 hourly runs, both with last exit code 0. A heartbeat submitted through the installed launcher produced event `wd-v1-73ea8a3995e6065b01f48984d8361294` with `HEARTBEAT/submitted/heartbeat_only`, no Kanban task ID, and zero pending or failed delivery rows.
+
+## Residual risk and downstream verification
 
 The live journal records the first board submissions with outcome code `kanban_submission_failed` even though the same rows are in `submitted` state and have valid task IDs. This is misleading historical telemetry, not dropped work: board cards exist, later producer passes are `UNCHANGED_ACTIVE`, and no duplicate cards appeared. The open `proxy-erros` card remains normal incident work for Foreman and is not a rollout defect.
+
+The historical seed matrix is not yet complete: the board has car-log (`t_f5f4851f`), markdown links (`t_c9ae1426`), dead extract-atoms-drain (`t_51fb825d`), Azure proxy timeouts (`t_3124a037`), and ledger/billing (`t_affddb11`), but no separate gateway-restart/EX_TEMPFAIL incident. Ledger/billing does not replace the gateway-restart category required by root acceptance criterion 9. Downstream installation/seeding card `t_33ffd4c5` must remediate and verify that missing historical incident before root approval.
+
+The live producer also intentionally differs from this branch in its newer Azure proxy attribution block, but it still lacks this branch's strict `v3` stable-key sanitization. Downstream card `t_33ffd4c5` must reconcile that isolated boundary change without overwriting the independently deployed proxy repair.
