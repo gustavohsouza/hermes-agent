@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -11,6 +10,15 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 
 STATUSES = ("running", "blocked", "review", "ready")
@@ -84,6 +92,19 @@ def _snapshot(hermes: str, env: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _try_lock(lock) -> bool:
+    """Take a non-blocking process lock, returning false on contention."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            lock.seek(0)
+            getattr(msvcrt, "locking")(lock.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
 def main() -> int:
     default_home = Path(os.environ.get("FOREMAN_DEFAULT_HOME", Path.home() / ".hermes")).resolve()
     state = Path(os.environ.get("FOREMAN_STATE_DIR", default_home / "state" / "foreman_sweep"))
@@ -92,17 +113,16 @@ def main() -> int:
     hermes = os.environ.get("FOREMAN_HERMES_BIN") or shutil.which("hermes", path=env["PATH"]) or "hermes"
     timeout = int(os.environ.get("FOREMAN_CHAT_TIMEOUT_SECONDS", "480"))
 
-    lock = (state / "lock").open("a+")
-    try:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    lock = (state / "lock").open("a+", encoding="utf-8")
+    if not _try_lock(lock):
+        lock.close()
         return 0
 
     try:
         snapshot = _snapshot(hermes, env)
         digest = hashlib.sha256(snapshot.encode()).hexdigest()[:16]
         last_hash = state / "last_hash"
-        if last_hash.exists() and last_hash.read_text().strip() == digest:
+        if last_hash.exists() and last_hash.read_text(encoding="utf-8").strip() == digest:
             return 0
 
         prompt = (
@@ -122,7 +142,7 @@ def main() -> int:
             print(completed.stderr.strip() or completed.stdout.strip() or "foreman chat failed", file=sys.stderr)
             return completed.returncode
 
-        last_hash.write_text(digest + "\n")
+        last_hash.write_text(digest + "\n", encoding="utf-8")
         output = completed.stdout.strip()
         if output and output != "[SILENT]":
             print(output)
