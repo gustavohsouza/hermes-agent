@@ -139,6 +139,7 @@ class KanbanSubmissionTests(unittest.TestCase):
             self.assertEqual(launcher.resolve(), result["launcher"])
             self.assertEqual(0o700, launcher.stat().st_mode & 0o777)
             self.assertIn(str(profile / "lib" / "watchdog-bridge"), launcher.read_text(encoding="utf-8"))
+            self.assertIn(f"cd '{profile / 'lib' / 'watchdog-bridge'}'", launcher.read_text(encoding="utf-8"))
             self.assertIn(str(Path(__import__("sys").executable).resolve()), launcher.read_text(encoding="utf-8"))
             backup = profile / "backups" / "watchdog-bridge" / "20260910T020000Z" / "bin" / "watchdog-kanban-intake"
             self.assertEqual("old launcher", backup.read_text(encoding="utf-8"))

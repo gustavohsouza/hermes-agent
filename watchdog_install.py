@@ -44,6 +44,7 @@ def install(profile: Path, source: Path, *, timestamp: str | None = None) -> dic
     launcher.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
+        f"cd {str(deployment)!r}\n"
         f"PYTHONPATH={str(deployment)!r}${{PYTHONPATH:+:$PYTHONPATH}} "
         f"exec {str(Path(sys.executable).resolve())!r} -m watchdog_runtime --json-stdin\n",
         encoding="utf-8",
