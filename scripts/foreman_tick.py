@@ -22,16 +22,18 @@ except ImportError:  # pragma: no cover - POSIX
 
 
 STATUSES = ("running", "blocked", "review", "ready")
-VOLATILE_KEYS = {"now", "oldest_ready_age_seconds"}
-BOARD_ENV_KEYS = (
-    "HERMES_KANBAN_TASK",
-    "HERMES_KANBAN_RUN_ID",
-    "HERMES_KANBAN_CLAIM_LOCK",
-    "HERMES_KANBAN_GOAL_MODE",
-    "HERMES_KANBAN_GOAL_MAX_TURNS",
-    "HERMES_KANBAN_WORKSPACE",
-    "HERMES_DELEGATED_CHILD_CONTEXT",
-)
+VOLATILE_KEYS = {
+    "now",
+    "oldest_ready_age_seconds",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "claimed_at",
+    "heartbeat_at",
+    "completed_at",
+    "ended_at",
+}
 
 
 def _stable(value):
@@ -40,10 +42,6 @@ def _stable(value):
             key: _stable(item)
             for key, item in sorted(value.items())
             if key not in VOLATILE_KEYS
-            and not key.endswith("_at")
-            and "time" not in key
-            and "age" not in key
-            and "seconds" not in key
         }
     if isinstance(value, list):
         return sorted((_stable(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True))
@@ -52,8 +50,11 @@ def _stable(value):
 
 def _command_env(default_home: Path) -> dict[str, str]:
     env = os.environ.copy()
-    for key in BOARD_ENV_KEYS:
-        env.pop(key, None)
+    for key in tuple(env):
+        if key.startswith("HERMES_KANBAN_"):
+            env.pop(key)
+    env.pop("HERMES_TENANT", None)
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     inherited_path = env.get("PATH", "")
     path_parts = [str(default_home / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
     path_parts.extend(part for part in inherited_path.split(os.pathsep) if part)
@@ -84,10 +85,7 @@ def _snapshot(hermes: str, env: dict[str, str]) -> str:
     ]
     for status in STATUSES:
         rows = _json_command(hermes, env, "kanban", "list", "--status", status, "--json")
-        projected = sorted(
-            ({key: row.get(key) for key in ("id", "assignee", "status", "title")} for row in rows),
-            key=lambda row: str(row.get("id")),
-        )
+        projected = sorted((_stable(row) for row in rows), key=lambda row: str(row.get("id")))
         lines.append(json.dumps(projected, sort_keys=True))
     return "\n".join(lines) + "\n"
 
