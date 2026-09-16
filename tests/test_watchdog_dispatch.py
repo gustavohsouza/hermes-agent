@@ -136,7 +136,13 @@ class WatchdogDispatchTests(unittest.TestCase):
         self.assertIn('notify "${OUT:-$MSG}"', script)
         self.assertEqual(2, script.count('notify "'))
         self.assertIn("Watchdog automation failed", notify_body)
+
+    def test_watchdog_sanitizes_v3_alarm_keys_for_intake_boundary(self):
+        script = (Path(__file__).parents[1] / "bin" / "watchdog.sh").read_text(encoding="utf-8")
+        self.assertIn("tr '[:upper:] ' '[:lower:]-'", script)
         self.assertIn("tr -cd 'a-z0-9._-'", script)
+        self.assertIn('[ -n "$V3KEY" ] || V3KEY="alarm"', script)
+        self.assertIn('add "v3-${V3KEY}"', script)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ Audited on 2026-09-16 against commit `3f58a2e9a2d7c75fbc154eb78ef5c5c2ae08a85f` 
 | Raw initial alert is suppressed | `bin/watchdog.sh:61-95` sends normal events only to the intake bridge; `tests/test_watchdog_lifecycle_e2e.py:143` proves no delivery before closure. |
 | Closure/tier-3 is durable and exactly once | `tests/test_watchdog_lifecycle_e2e.py:145-169,240-256`; delivery uses stable idempotency keys and retries pending records. |
 | Bounded operation | Live cards have `max_runtime_seconds=86400` and `max_retries=3`; their bodies say `TTL 24h; max-runs 3`; continuation policy is also tested at `tests/test_watchdog_lifecycle_e2e.py:139-141,179`. |
-| Historical incidents seeded | Live board contains the five requested 2026-09-09 categories: car log (`t_f5f4851f`), markdown links (`t_c9ae1426`), dead extract-atoms-drain (`t_51fb825d`), Azure proxy timeouts (`t_3124a037`), and ledger versus Azure billing mismatch (`t_affddb11`). |
+| Historical incidents seeded | Live board contains all six requested categories: car log (`t_f5f4851f`), markdown links (`t_c9ae1426`), dead extract-atoms-drain (`t_51fb825d`), Azure proxy timeouts (`t_3124a037`), ledger versus Azure billing mismatch (`t_affddb11`), and the previously missing gateway-restart/EX_TEMPFAIL incident (`t_6ca0bf30`). The gateway card uses deterministic idempotency key `wd-incident-v1-v3-gateway-do-hermes-reinic-2ad20c760172def5f4971634`; a repeated create returned the same task ID, and a board query found exactly one matching row assigned to `foreman`. |
 | Non-delivering smoke | Archived live card `t_f4465637` was created by `watchdog`; normal smoke/intake did not create an outbound closure record. |
 | Producers activated | `launchctl print` reports both `com.gustavo.brain-watchdog` (08:30 calendar trigger, 8 runs, last exit 0) and `com.gustavo.brain-watchdog-hourly` (3600-second interval, 23 runs, last exit 0), both targeting `/Users/gustavosouza/hermes/bin/watchdog.sh`. Installed bridge files exist at the fixed profile paths. |
 | Journal/board evidence | Live journal contains five accepted event IDs and per-key state for three current producer keys. Subsequent events are `UNCHANGED_ACTIVE` and do not create duplicate cards. |
@@ -22,7 +22,7 @@ Audited on 2026-09-16 against commit `3f58a2e9a2d7c75fbc154eb78ef5c5c2ae08a85f` 
 ## Verification
 
     python -m unittest tests.test_watchdog_dispatch tests.test_watchdog_intake tests.test_watchdog_kanban tests.test_watchdog_closure tests.test_watchdog_lifecycle_e2e -v
-    Ran 49 tests in 4.904s
+    Ran 50 tests in 4.226s
     OK
 
     git diff --check
@@ -33,4 +33,10 @@ Audited on 2026-09-16 against commit `3f58a2e9a2d7c75fbc154eb78ef5c5c2ae08a85f` 
 
 ## Residual risk
 
-The live journal records the first board submissions with outcome code `kanban_submission_failed` even though the same rows are in `submitted` state and have valid task IDs. This is misleading historical telemetry, not dropped work: board cards exist, later producer passes are `UNCHANGED_ACTIVE`, and no duplicate cards appeared. The open `proxy-erros` card remains normal incident work for Foreman and is not a rollout defect.
+The live journal records the first board submissions with outcome code `kanban_submission_failed` even though the same rows are in `submitted` state and have valid task IDs. This is misleading historical telemetry, not dropped work: board cards exist, later producer passes are `UNCHANGED_ACTIVE`, and no duplicate cards appeared. The open `proxy-erros` and historical `v3-gateway-do-hermes-reinic` cards remain normal incident work for Foreman and are not rollout defects.
+
+## Final reconciliation (2026-09-16)
+
+The live producer retained the independently deployed `proxy_error_attribution.py --watchdog` block and received only the strict v3 key boundary from `bin/watchdog.sh`: lowercase conversion, spaces to hyphens, removal of characters outside `[a-z0-9._-]`, and an `alarm` fallback. `zsh -n /Users/gustavosouza/hermes/bin/watchdog.sh` exits 0; grep finds both the proxy attribution call and one strict sanitizer. `tests.test_watchdog_dispatch` now asserts this boundary.
+
+The missing historical gateway incident was seeded as Foreman-owned card `t_6ca0bf30` using the exact available 2026-09-09 alert evidence and deterministic incident key. Repeating creation with the same idempotency key returned `t_6ca0bf30`, and SQLite returned one matching row.
