@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import stat
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,7 +45,7 @@ def install(profile: Path, source: Path, *, timestamp: str | None = None) -> dic
         "#!/bin/sh\n"
         "set -eu\n"
         f"PYTHONPATH={str(deployment)!r}${{PYTHONPATH:+:$PYTHONPATH}} "
-        "exec python3 -m watchdog_runtime --json-stdin\n",
+        f"exec {str(Path(sys.executable).resolve())!r} -m watchdog_runtime --json-stdin\n",
         encoding="utf-8",
     )
     launcher.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
