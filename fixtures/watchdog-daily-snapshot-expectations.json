@@ -1,0 +1,50 @@
+{
+  "contract_version": 1,
+  "cases": [
+    {
+      "name": "missing-active-keys-rejects",
+      "input": {
+        "version": 1,
+        "mode": "daily",
+        "observed_at": "2026-09-09T20:00:00Z",
+        "message": "opaque daily message"
+      },
+      "expect": {
+        "accepted": false,
+        "error_code": "missing_active_keys",
+        "journal_writes": 0
+      }
+    },
+    {
+      "name": "explicit-empty-active-keys-is-empty-snapshot",
+      "input": {
+        "version": 1,
+        "mode": "daily",
+        "observed_at": "2026-09-09T20:00:00Z",
+        "message": "opaque daily message",
+        "active_keys": []
+      },
+      "expect": {
+        "accepted": true,
+        "derived_transitions": "gone_for_prior_active_keys_only_if_newer",
+        "journal_writes": "at_least_one"
+      }
+    },
+    {
+      "name": "daily-supplied-transitions-reject",
+      "input": {
+        "version": 1,
+        "mode": "daily",
+        "observed_at": "2026-09-09T20:00:00Z",
+        "message": "opaque daily message",
+        "active_keys": [],
+        "new_keys": []
+      },
+      "expect": {
+        "accepted": false,
+        "error_code": "daily_transition_collection_forbidden",
+        "journal_writes": 0
+      }
+    }
+  ]
+}
