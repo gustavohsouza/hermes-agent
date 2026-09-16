@@ -35,7 +35,7 @@ class HermesKanbanPort:
             task_id = self.api.create_task(
                 connection,
                 title=title,
-                body=body,
+                body=_comment(body, metadata),
                 assignee=assignee,
                 created_by="watchdog",
                 idempotency_key=idempotency_key,
