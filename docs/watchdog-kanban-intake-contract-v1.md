@@ -264,3 +264,27 @@ Downstream callers may invoke the integration directly without shell interpolati
 - duplicate delivery and simulated crash after journal commit resume without a second card;
 - a daily payload without `active_keys` rejects before journal write, while a daily payload with explicit `"active_keys": []` is accepted and derives GONE only from a newer prior daily snapshot; supplied `new_keys` or `gone_keys` on daily reject;
 - NEW, unchanged, GONE, mixed, heartbeat, recurrence, stale, and out-of-order cases execute the effects listed above.
+
+## Closure and escalation interface
+
+`watchdog_closure.ClosureReporter` owns outbound incident reports. Call
+`complete(stable_key, task_id, occurrence_id, outcome, verification_source="independent")` only
+after the Foreman task has recorded one allowed classification, treatment or
+dismissal, follow-through, empirical verification, and residual risk. A
+`verification_source` of `watchdog_resolvido` is rejected: RESOLVIDO remains a
+wake/update signal, never closure proof. `tier-3` is rejected as a completion
+classification and may contact Gustavo before closure only through
+`escalate_tier3(...)`.
+
+Both operations first insert a deterministic report row into
+`watchdog_reports`; delivery retries consume only pending/failed rows and reuse
+the same `wd-closure-v1-*` or `wd-tier3-v1-*` idempotency key. Sent rows are no
+longer selectable, so repeated completion events cannot send another report.
+The fixed destination is `whatsapp:117484669640820@lid`. Integrators provide a
+`DeliveryPort.send(target, text, idempotency_key)` implementation; unit and E2E
+tests must use a test double and must not contact the real gateway.
+
+`deterministic_heartbeat_outcome(event)` permits no-action auto-closure only for
+a version-1 daily snapshot whose `active_keys` is explicitly empty. Its output
+is a complete informational outcome with point-in-time residual risk; any active
+key or non-daily payload rejects.
