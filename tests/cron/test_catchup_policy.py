@@ -26,6 +26,13 @@ def test_missed_policy_preserves_grace_and_manual(tmp_path, monkeypatch, catch_u
         assert jobs._ensure_aware(jobs.datetime.fromisoformat(stale["next_run_at"])) > now
 
 
+def test_default_config_enables_unreachable_retry():
+    """The spend-neutral zero-call retry ladder is on unless explicitly disabled."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["retry_unreachable"] is True
+
+
 @pytest.mark.parametrize("uncomputable", [False, True])
 def test_default_and_uncomputable_still_catch_up(tmp_path, monkeypatch, uncomputable):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
