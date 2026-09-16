@@ -356,7 +356,13 @@ AZ=$(curl -s -m 30 -o /dev/null -w "%{http_code}" http://127.0.0.1:8011/v1/chat/
 if [ "$MODE" != "--check" ] && [ -f "$HOME/hermes/bin/watchdog_v3.py" ]; then
   while IFS= read -r line; do
     case "$line" in
-      ALARM\ *) add v3-"$(echo "${line#ALARM }" | cut -c1-24 | tr ' ' '-')" "${line#ALARM }" ;;
+      ALARM\ *)
+        # v3 prose can contain uppercase, punctuation, and accents. Stable keys
+        # crossing the intake boundary must remain in its strict ASCII alphabet.
+        V3KEY=$(printf '%s' "${line#ALARM }" | cut -c1-24 | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9._-')
+        [ -n "$V3KEY" ] || V3KEY="alarm"
+        add "v3-${V3KEY}" "${line#ALARM }"
+        ;;
       INFO\ *)  INFO+=("${line#INFO }") ;;
     esac
   done < <(python3 "$HOME/hermes/bin/watchdog_v3.py" 2>/dev/null)

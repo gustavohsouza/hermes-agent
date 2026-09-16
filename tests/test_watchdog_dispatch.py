@@ -136,6 +136,7 @@ class WatchdogDispatchTests(unittest.TestCase):
         self.assertIn('notify "${OUT:-$MSG}"', script)
         self.assertEqual(2, script.count('notify "'))
         self.assertIn("Watchdog automation failed", notify_body)
+        self.assertIn("tr -cd 'a-z0-9._-'", script)
 
 
 if __name__ == "__main__":
