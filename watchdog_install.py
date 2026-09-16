@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-BRIDGE_FILES = ("watchdog_boundary.py", "watchdog_kanban.py", "watchdog_runtime.py")
+BRIDGE_FILES = ("watchdog_boundary.py", "watchdog_kanban.py", "watchdog_runtime.py", "watchdog_closure.py")
 LAUNCHER_NAME = "watchdog-kanban-intake"
 
 

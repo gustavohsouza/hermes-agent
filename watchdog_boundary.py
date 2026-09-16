@@ -6,8 +6,9 @@ import json
 import math
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
@@ -191,6 +192,7 @@ class Journal:
         CREATE TABLE IF NOT EXISTS watchdog_incident_deliveries (event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), stable_key TEXT NOT NULL, transition TEXT NOT NULL, incident_key TEXT NOT NULL, kanban_task_id TEXT, delivery_state TEXT NOT NULL CHECK(delivery_state IN ('pending','submitted','failed')), outcome_code TEXT, PRIMARY KEY(event_id, stable_key, transition));
         CREATE TABLE IF NOT EXISTS watchdog_incident_state (stable_key TEXT PRIMARY KEY, lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('open','gone')), incident_key TEXT NOT NULL UNIQUE, kanban_task_id TEXT, latest_applied_at TEXT NOT NULL, latest_applied_event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), latest_applied_digest TEXT NOT NULL, recurrence_root_event_id TEXT REFERENCES watchdog_events(event_id), recurrence_version INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS watchdog_daily_snapshot (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), observed_at TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES watchdog_events(event_id), full_digest TEXT NOT NULL, active_keys_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS watchdog_reports (report_key TEXT PRIMARY KEY, stable_key TEXT NOT NULL, task_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('closure','tier3')), payload_json TEXT NOT NULL, delivery_state TEXT NOT NULL CHECK(delivery_state IN ('pending','delivering','sent','failed')), attempt_count INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, claim_token TEXT, claim_until TEXT, sent_at TEXT);
         """)
         delivery_columns = {
             row[1] for row in self.connection.execute("PRAGMA table_info(watchdog_incident_deliveries)")
@@ -334,3 +336,74 @@ class Journal:
         return row[0] if row else None
 
     def event_count(self) -> int: return int(self.connection.execute("SELECT COUNT(*) FROM watchdog_events").fetchone()[0])
+
+    def queue_report(self, report_key: str, stable_key: str, task_id: str, kind: str,
+                     payload: Mapping[str, Any]) -> bool:
+        if kind not in {"closure", "tier3"} or not report_key or not task_id:
+            raise IntakeError("invalid_report")
+        encoded = _canonical_json(payload)
+        with self.connection:
+            existing = self.connection.execute(
+                "SELECT stable_key,task_id,kind,payload_json FROM watchdog_reports WHERE report_key=?",
+                (report_key,),
+            ).fetchone()
+            if existing:
+                if existing != (stable_key, task_id, kind, encoded):
+                    raise IntakeError("report_key_conflict")
+                return False
+            self.connection.execute(
+                "INSERT INTO watchdog_reports(report_key,stable_key,task_id,kind,payload_json,delivery_state) VALUES(?,?,?,?,?,'pending')",
+                (report_key, stable_key, task_id, kind, encoded),
+            )
+        return True
+
+    def claim_report(self) -> tuple[str, str, dict[str, Any], str] | None:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        claim_until = (now + timedelta(minutes=5)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        token = uuid.uuid4().hex
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT report_key,kind,payload_json FROM watchdog_reports "
+                "WHERE delivery_state IN ('pending','failed') OR "
+                "(delivery_state='delivering' AND claim_until<?) ORDER BY report_key LIMIT 1",
+                (now_text,),
+            ).fetchone()
+            if row is None:
+                self.connection.commit()
+                return None
+            self.connection.execute(
+                "UPDATE watchdog_reports SET delivery_state='delivering',claim_token=?,claim_until=? WHERE report_key=?",
+                (token, claim_until, row[0]),
+            )
+            self.connection.commit()
+            return row[0], row[1], json.loads(row[2]), token
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def mark_report_sent(self, report_key: str, claim_token: str) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        with self.connection:
+            if self.connection.execute(
+                "UPDATE watchdog_reports SET delivery_state='sent',attempt_count=attempt_count+1,last_error_code=NULL,claim_token=NULL,claim_until=NULL,sent_at=? WHERE report_key=? AND delivery_state='delivering' AND claim_token=?",
+                (now, report_key, claim_token),
+            ).rowcount != 1:
+                raise IntakeError("unknown_or_sent_report")
+
+    def mark_report_failed(self, report_key: str, claim_token: str, code: str) -> None:
+        if not code or len(code) > 128:
+            raise IntakeError("invalid_failure_code")
+        with self.connection:
+            if self.connection.execute(
+                "UPDATE watchdog_reports SET delivery_state='failed',attempt_count=attempt_count+1,last_error_code=?,claim_token=NULL,claim_until=NULL WHERE report_key=? AND delivery_state='delivering' AND claim_token=?",
+                (code, report_key, claim_token),
+            ).rowcount != 1:
+                raise IntakeError("unknown_or_sent_report")
+
+    def report_state(self, report_key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT delivery_state FROM watchdog_reports WHERE report_key=?", (report_key,)
+        ).fetchone()
+        return row[0] if row else None
