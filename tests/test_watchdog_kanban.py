@@ -97,7 +97,10 @@ class KanbanSubmissionTests(unittest.TestCase):
             creates = [call for call in api.calls if call[0] == "create_task"]
             self.assertEqual(1, len(creates))
             self.assertEqual("foreman", creates[0][1]["assignee"])
+            self.assertEqual(24 * 60 * 60, creates[0][1]["max_runtime_seconds"])
+            self.assertEqual(3, creates[0][1]["max_retries"])
             self.assertTrue(creates[0][1]["idempotency_key"].startswith("wd-incident-v1-x-"))
+            self.assertIn("objective ceiling 56 total runs; TTL 24h; max-runs 3", creates[0][1]["body"])
             submitted_message = creates[0][1]["body"].split("\nWatchdog message (opaque UTF-8):\n", 1)[1]
             self.assertEqual(hostile_message.encode("utf-8"), submitted_message.encode("utf-8"))
             self.assertEqual("default", [call for call in api.calls if call[0] == "connect"][0][1])

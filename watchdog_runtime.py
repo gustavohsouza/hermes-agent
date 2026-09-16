@@ -39,6 +39,8 @@ class HermesKanbanPort:
                 assignee=assignee,
                 created_by="watchdog",
                 idempotency_key=idempotency_key,
+                max_runtime_seconds=24 * 60 * 60,
+                max_retries=3,
             )
             return task_id
 

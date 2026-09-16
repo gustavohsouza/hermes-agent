@@ -41,6 +41,8 @@ class KanbanSubmissionAdapter:
         body = (
             f"Watchdog transition: {transition}\n"
             f"Stable key: {stable_key}\n"
+            "Execution policy: objective ceiling 56 total runs; TTL 24h; max-runs 3; "
+            "do not create orphan continuations.\n"
             f"{context}\n"
             "Watchdog message (opaque UTF-8):\n"
             f"{message}"
