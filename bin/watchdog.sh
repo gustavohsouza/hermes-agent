@@ -97,8 +97,10 @@ notify() {
 # ---------------------------------------------------------------- servicos
 # launchctl, nao pgrep: o pgrep do macOS usa ERE, entao o antigo padrao com
 # "\|" nunca casava e o watchdog gritava "gateway caido" todo dia com o
-# gateway no ar. Alarme falso diario = watchdog ignorado.
-launchctl print "gui/$(id -u)/ai.hermes.gateway" 2>/dev/null | grep -q "state = running" \
+# gateway no ar. Ventura+ pode registrar o LaunchAgent em user/<uid>, mas
+# instalacoes existentes ainda podem usar gui/<uid>; aceitar ambos sem deixar
+# de exigir state=running.
+"${0:A:h}/watchdog_gateway_running.sh" "$(id -u)" "ai.hermes.gateway" \
   && good gateway || add gateway "gateway do Hermes caido"
 curl -s -m 8 http://127.0.0.1:8011/health >/dev/null 2>&1 \
   && good proxy-azure || add proxy "proxy Azure fora"
