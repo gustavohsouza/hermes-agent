@@ -49,6 +49,24 @@ def test_execution_can_be_loaded_by_exact_attempt_id(monkeypatch, tmp_path):
     assert executions.get_execution("missing") is None
 
 
+def test_live_owner_tolerates_macos_process_start_time_drift(monkeypatch):
+    import cron.executions as executions
+
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: 100_800)
+
+    assert executions._owner_is_live(42, 100_000) is True
+
+
+def test_live_pid_with_distinct_start_time_is_not_the_owner(monkeypatch):
+    import cron.executions as executions
+
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: 200_000)
+
+    assert executions._owner_is_live(42, 100_000) is False
+
+
 def test_fresh_external_handoff_is_not_recovered_before_worker_adopts(
     monkeypatch, tmp_path
 ):
