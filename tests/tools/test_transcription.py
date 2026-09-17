@@ -53,6 +53,13 @@ class TestGetProvider:
         from tools.transcription_tools import _get_provider
         assert _get_provider({"enabled": False, "provider": "openai"}) == "none"
 
+    def test_azure_foundry_credential_probe_uses_config_resolver(self, monkeypatch):
+        """The explicit Azure provider probe must not depend on an undefined facade global."""
+        monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "azure-test-key")
+        monkeypatch.setenv("AZURE_FOUNDRY_BASE_URL", "https://gus-foundry.openai.azure.com/openai/v1")
+        from tools.transcription_tools import _has_azure_foundry_stt_credentials
+        assert _has_azure_foundry_stt_credentials() is True
+
 
 # ---------------------------------------------------------------------------
 # File validation
@@ -202,6 +209,27 @@ class TestTranscribeOpenAI:
             "https://gus-foundry.openai.azure.com/openai/deployments/gpt-4o-mini-transcribe")
         assert client_cls.call_args.kwargs["default_query"] == {"api-version": "2024-06-01"}
         assert mock_client.audio.transcriptions.create.call_args.kwargs["language"] == "pt"
+
+    def test_gpt_transcribe_uses_languages_array(self, monkeypatch, tmp_path):
+        """The 2026 gpt-transcribe deployment rejects the legacy singular language field."""
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"fake audio")
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = SimpleNamespace(text="Olá Gus")
+        monkeypatch.setenv("AZURE_FOUNDRY_API_KEY", "azure-test-key")
+        monkeypatch.setenv("AZURE_FOUNDRY_BASE_URL", "https://gus-foundry.openai.azure.com/openai/v1")
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "azure_foundry": {"model": "gpt-transcribe", "language": "pt"},
+             }), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_azure_foundry
+            result = _transcribe_azure_foundry(str(audio_file), "gpt-transcribe")
+
+        assert result == {"success": True, "transcript": "Olá Gus", "provider": "azure_foundry"}
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {"languages": ["pt"]}
+        assert "language" not in kwargs
 
 
 # ---------------------------------------------------------------------------

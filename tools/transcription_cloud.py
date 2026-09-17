@@ -181,7 +181,8 @@ def _transcribe_azure_foundry(
     ``~/hermes/bin/transcribe_audio_dir.py`` has used in production. Bearer auth with the
     api-key is accepted there, so the plain OpenAI SDK client still works.
     """
-    from tools.transcription_tools import _resolve_stt_language, get_env_value
+    from hermes_cli.config import get_env_value
+    from tools.transcription_tools import _resolve_stt_language
     api_key = str(get_env_value("AZURE_FOUNDRY_API_KEY") or "").strip()
     base_url = str(get_env_value("AZURE_FOUNDRY_BASE_URL") or "").strip()
     if not api_key or not base_url:

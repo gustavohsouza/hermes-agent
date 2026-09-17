@@ -137,7 +137,8 @@ def _has_key(env_var: str, provider: str, *, needs_openai: bool = False, needs_m
 
 
 def _has_azure_foundry_stt_credentials() -> bool:
-    """Azure Foundry STT is enabled only when its own v1 endpoint and key exist."""
+    """Azure Foundry STT is enabled only when its endpoint and key exist."""
+    from hermes_cli.config import get_env_value
     return bool(str(get_env_value("AZURE_FOUNDRY_API_KEY") or "").strip()
                 and str(get_env_value("AZURE_FOUNDRY_BASE_URL") or "").strip())
 
