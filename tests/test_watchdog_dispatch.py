@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -143,6 +145,89 @@ class WatchdogDispatchTests(unittest.TestCase):
         self.assertIn("tr -cd 'a-z0-9._-'", script)
         self.assertIn('[ -n "$V3KEY" ] || V3KEY="alarm"', script)
         self.assertIn('add "v3-${V3KEY}"', script)
+
+    def test_test_mode_synthetic_new_cannot_reach_production_board_launcher(self):
+        fake_home = self.root / "home"
+        production_board = fake_home / ".hermes" / "kanban.db"
+        production_board.parent.mkdir(parents=True)
+        production_board.write_bytes(b"production-board-sentinel")
+        launcher_calls = self.root / "launcher-calls"
+        dispatcher = self.root / "dispatcher.py"
+        dispatcher.write_text(
+            "from pathlib import Path\n"
+            "import os, subprocess, sys\n"
+            "launcher = sys.argv[sys.argv.index('--launcher') + 1]\n"
+            "subprocess.run([launcher], input=sys.stdin.buffer.read(), check=True)\n",
+            encoding="utf-8",
+        )
+        launcher = self.root / "production-intake"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            f"printf called >> {str(launcher_calls)!r}\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        python_path = fake_home / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        python_path.symlink_to(sys.executable)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(fake_home),
+            "HERMES_KANBAN_DB": str(production_board),
+            "WATCHDOG_TEST_KANBAN_DB": str(production_board),
+            "WATCHDOG_TEST_MODE": "1",
+            "WATCHDOG_TEST_SYNTHETIC_NEW": "no-linkedin-session",
+            "WATCHDOG_STATE": str(self.root / "state.json"),
+            "WATCHDOG_LOG": str(self.root / "watchdog.log"),
+            "WATCHDOG_TEST_NOTIFICATION_LOG": str(self.root / "notifications.log"),
+            "WATCHDOG_SPOOL": str(self.root / "spool"),
+            "WATCHDOG_DISPATCH": str(dispatcher),
+            "WATCHDOG_INTAKE": str(launcher),
+            "WATCHDOG_TEST_INTAKE": str(launcher),
+        })
+        result = subprocess.run(
+            ["/bin/zsh", str(Path(__file__).parents[1] / "bin" / "watchdog.sh"), "--check"],
+            env=env, capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(64, result.returncode, result.stderr)
+        self.assertIn("isolated Kanban", result.stderr)
+        self.assertFalse(launcher_calls.exists(), "test mode leaked synthetic NEW to Kanban intake")
+        self.assertEqual(b"production-board-sentinel", production_board.read_bytes())
+
+    def test_test_mode_can_explicitly_disable_kanban(self):
+        script = Path(__file__).parents[1] / "bin" / "watchdog.sh"
+        fake_home = self.root / "home"
+        python_path = fake_home / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        python_path.symlink_to(sys.executable)
+        launcher_calls = self.root / "launcher-calls"
+        launcher = self.root / "intake"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            f"printf called >> {str(launcher_calls)!r}\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(fake_home),
+            "WATCHDOG_TEST_MODE": "1",
+            "WATCHDOG_TEST_DISABLE_KANBAN": "1",
+            "WATCHDOG_STATE": str(self.root / "state.json"),
+            "WATCHDOG_LOG": str(self.root / "watchdog.log"),
+            "WATCHDOG_TEST_NOTIFICATION_LOG": str(self.root / "notifications.log"),
+            "WATCHDOG_SPOOL": str(self.root / "spool"),
+            "WATCHDOG_DISPATCH": str(self.root / "missing-dispatcher"),
+            "WATCHDOG_INTAKE": str(launcher),
+        })
+        result = subprocess.run(
+            ["/bin/zsh", str(script), "--check"], env=env, capture_output=True,
+            text=True, check=False, timeout=30,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(launcher_calls.exists())
+        self.assertFalse((self.root / "spool").exists())
+        self.assertTrue((self.root / "notifications.log").exists())
 
 
 if __name__ == "__main__":

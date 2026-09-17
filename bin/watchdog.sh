@@ -32,9 +32,11 @@ WATCHDOG_DISPATCH="${WATCHDOG_DISPATCH:-$HOME/hermes/bin/watchdog_dispatch.py}"
 WATCHDOG_INTAKE="${WATCHDOG_INTAKE:-$HOME/.hermes/bin/watchdog-kanban-intake}"
 WATCHDOG_SPOOL="${WATCHDOG_SPOOL:-$HOME/.hermes/state/watchdog-spool}"
 
-# Tests must fail closed against external delivery. A harness may set
-# WATCHDOG_TEST_MODE=1, but only after redirecting both state and notification
-# capture away from production.
+# Tests must fail closed against every external side effect. State and delivery
+# capture must be redirected, and Kanban must either be disabled or explicitly
+# bound to a test-only intake and board. Merely isolating Watchdog state is not
+# enough: the intake launcher otherwise resolves the production/default board.
+WATCHDOG_TEST_KANBAN_DISABLED=0
 if [ "${WATCHDOG_TEST_MODE:-0}" = "1" ]; then
   case "$STATE" in
     "$HOME/.hermes/watchdog-state.json")
@@ -50,6 +52,17 @@ if [ "${WATCHDOG_TEST_MODE:-0}" = "1" ]; then
     print -u2 "WATCHDOG_TEST_MODE requires WATCHDOG_LOG"
     exit 64
   }
+  if [ "${WATCHDOG_TEST_DISABLE_KANBAN:-0}" = "1" ]; then
+    WATCHDOG_TEST_KANBAN_DISABLED=1
+  elif [ -z "${WATCHDOG_TEST_KANBAN_DB:-}" ] \
+      || [ "${HERMES_KANBAN_DB:-}" != "$WATCHDOG_TEST_KANBAN_DB" ] \
+      || [ "$WATCHDOG_TEST_KANBAN_DB" = "$HOME/.hermes/kanban.db" ] \
+      || [ -z "${WATCHDOG_TEST_INTAKE:-}" ] \
+      || [ "$WATCHDOG_INTAKE" != "$WATCHDOG_TEST_INTAKE" ] \
+      || [ "$WATCHDOG_TEST_INTAKE" = "$HOME/.hermes/bin/watchdog-kanban-intake" ]; then
+    print -u2 "WATCHDOG_TEST_MODE requires Kanban disabled or an isolated Kanban intake and board"
+    exit 64
+  fi
 fi
 
 # P = problemas ativos nesta rodada, no formato "chave|texto legivel"
@@ -69,6 +82,13 @@ notify() {
 
   if [ "${WATCHDOG_TEST_MODE:-0}" = "1" ]; then
     print -r -- "$msg" >> "$WATCHDOG_TEST_NOTIFICATION_LOG"
+  fi
+
+  # Test harnesses that do not need intake can explicitly suppress Kanban after
+  # isolating state/log paths. This still exercises alert construction without
+  # invoking a launcher or writing a spool entry.
+  if [ "$WATCHDOG_TEST_KANBAN_DISABLED" = "1" ]; then
+    return 0
   fi
 
   # Pass opaque alert data only over a NUL-delimited stdin protocol to a fixed
