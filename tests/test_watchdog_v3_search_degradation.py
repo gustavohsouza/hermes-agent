@@ -65,6 +65,18 @@ def test_quoted_marker_from_non_gbrain_tools_is_ignored(messages_db, tool_name):
                 }
             ),
         ),
+        (
+            "mcp__gbrain__search",
+            '<untrusted_tool_result source="mcp__gbrain__search">\n'
+            "The following content was retrieved from an external source.\n\n"
+            + json.dumps(
+                {
+                    "result": "[]",
+                    "_meta": {"retrieval": {"degraded": [MARKER]}},
+                }
+            )
+            + "\n</untrusted_tool_result>",
+        ),
     ],
 )
 def test_gbrain_search_and_query_result_encodings_are_counted(
@@ -82,6 +94,33 @@ def test_healthy_gbrain_result_is_ignored(messages_db):
         content=json.dumps(
             {"_meta": {"retrieval": {"vector_enabled": True, "degraded": []}}}
         ),
+    )
+
+    assert wd.count_degraded_search_results(messages_db, since=100.0) == 0
+
+
+def test_healthy_gbrain_result_quoting_marker_is_ignored(messages_db):
+    insert_message(
+        messages_db,
+        tool_name="mcp__gbrain__search",
+        content=json.dumps(
+            {
+                "result": [{"text": f"prior incident mentioned {MARKER}"}],
+                "_meta": {
+                    "retrieval": {"vector_enabled": True, "degraded": []}
+                },
+            }
+        ),
+    )
+
+    assert wd.count_degraded_search_results(messages_db, since=100.0) == 0
+
+
+def test_gbrain_tool_call_quoting_marker_is_ignored(messages_db):
+    insert_message(
+        messages_db,
+        tool_name="mcp__gbrain__search",
+        content=f'[tool_call]\n{{"query": "find {MARKER}"}}',
     )
 
     assert wd.count_degraded_search_results(messages_db, since=100.0) == 0
