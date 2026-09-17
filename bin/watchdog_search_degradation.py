@@ -55,8 +55,10 @@ def _has_degradation_metadata(content: str) -> bool:
         return False
     return any(
         isinstance(value, dict)
-        and isinstance(value.get("degraded"), list)
-        and DEGRADATION_MARKER in value["degraded"]
+        and isinstance(value.get("_meta"), dict)
+        and isinstance(value["_meta"].get("retrieval"), dict)
+        and isinstance(value["_meta"]["retrieval"].get("degraded"), list)
+        and DEGRADATION_MARKER in value["_meta"]["retrieval"]["degraded"]
         for value in _json_values(decoded)
     )
 

@@ -126,6 +126,21 @@ def test_gbrain_tool_call_quoting_marker_is_ignored(messages_db):
     assert wd.count_degraded_search_results(messages_db, since=100.0) == 0
 
 
+def test_unrelated_degraded_field_is_ignored(messages_db):
+    insert_message(
+        messages_db,
+        tool_name="mcp__gbrain__search",
+        content=json.dumps(
+            {
+                "result": {"degraded": [MARKER]},
+                "_meta": {"retrieval": {"degraded": []}},
+            }
+        ),
+    )
+
+    assert wd.count_degraded_search_results(messages_db, since=100.0) == 0
+
+
 def test_old_degraded_gbrain_result_is_ignored(messages_db):
     insert_message(
         messages_db,
