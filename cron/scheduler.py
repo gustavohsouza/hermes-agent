@@ -3673,7 +3673,13 @@ def _sweep_mcp_orphans() -> None:
         from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
         _kill_orphaned_mcp_children()
     except Exception as _e:
-        logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
+        evidence = f"post-tick MCP orphan cleanup failed: {type(_e).__name__}: {_e}"
+        logger.warning("%s", evidence)
+        _escalate_cron_failure(
+            {"id": "cron-scheduler", "name": "Cron scheduler", "failure_deliver": "local"},
+            "scheduler",
+            evidence,
+        )
 
 
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
@@ -3751,6 +3757,11 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _clear_run_claim_best_effort()
         logger.exception(
             "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
+        _escalate_cron_failure(
+            job,
+            "scheduler",
+            f"execution creation failed: {type(execution_err).__name__}: {execution_err}",
+        )
         return None
 
     def _run_and_release(j=dispatched_job, ctx=_ctx):
@@ -3770,6 +3781,11 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
             _not_dispatched_shutdown()
         else:
             logger.error("Job '%s' not dispatched: %s", job_label, submit_err)
+            _escalate_cron_failure(
+                job,
+                "scheduler",
+                f"executor dispatch failed: {type(submit_err).__name__}: {submit_err}",
+            )
         return None
 
     with _running_lock:
