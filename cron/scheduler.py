@@ -1682,10 +1682,13 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
                 with contextlib.suppress(Exception):
                     from cron.jobs import clear_preflight_alerted
                     clear_preflight_alerted(job_id)
-    except Exception:
-        # Fail open: the validator must never take down a runnable job.
-        logger.debug("Job '%s': preflight validation errored — failing open", job_id, exc_info=True)
-        _pf_reason = None
+    except Exception as e:
+        # Validation itself failed: this is a real preflight failure. Continuing
+        # would hide it as a healthy run and can burn an avoidable model call.
+        logger.error("Job '%s': preflight validation failed", job_id, exc_info=True)
+        return _blocked_config_result(
+            job_id, job_name, f"preflight validator failed: {type(e).__name__}: {e}"
+        )
     if not _pf_reason:
         return None
     return _blocked_config_result(job_id, job_name, _pf_reason)
@@ -2863,6 +2866,24 @@ def _compose_run_delivery(
     return deliver_content, blocked_config, blocked_config_silent, incident_acked, failure_incident_id
 
 
+def _escalate_cron_failure(job: dict, failure_class: str, error: object):
+    """Durably hand a failure to Claude before any operator-facing notice."""
+    from cron.failure_escalation import escalate_cron_failure
+
+    return escalate_cron_failure(job, failure_class, error)
+
+
+def _failure_class(job: dict, error: object) -> str:
+    text = str(error or "").lower()
+    if BLOCKED_CONFIG_MARKER in text or "blocked_config" in text:
+        return "preflight"
+    if job.get("no_agent"):
+        return "script"
+    if (job.get("monitor_script") or job.get("monitor_url")) and "monitor" in text:
+        return "monitor"
+    return "agent"
+
+
 class _FireClaimLostDuringSideEffect(Exception):
     """Raised inside a side-effect fence when the durable fire claim is no longer ours."""
 
@@ -2966,6 +2987,21 @@ def _save_compose_deliver(
             "(tool subprocess was killed mid-flight)."
         )
 
+    # Empty output is a failure before composition/delivery. Classifying it in
+    # the bookkeeping tail used to bypass escalation. Preserve the existing
+    # no-delivery contract after creating the durable failure signal.
+    empty_response = d.success and not final_response.strip()
+    if empty_response:
+        d.success = False
+        d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+    if not d.success:
+        _escalate_cron_failure(job, _failure_class(job, d.error), d.error)
+    if empty_response:
+        # Preserve the existing no-delivery contract for an empty model turn;
+        # escalation is the durable failure signal and bookkeeping records it.
+        return
+
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
     ) = _compose_run_delivery(
@@ -3021,6 +3057,8 @@ def _save_compose_deliver(
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
+    if d.delivery_error:
+        _escalate_cron_failure(job, "delivery", d.delivery_error)
 
 
 def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
@@ -3115,6 +3153,8 @@ def _deliver_crash_failure(
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
         logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
+    if delivery_error:
+        _escalate_cron_failure(job, "delivery", delivery_error)
     unresolved_origin = bool(
         not delivery_error
         and normalized_deliver == "origin"
@@ -3265,11 +3305,6 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
-        # Empty final_response is a soft failure so last_status is not "ok".
-        if d.success and not final_response.strip():
-            d.success = False
-            d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
         if _fire_claim_ownership_lost():
             # #105861: the claim check is one sample; a miss AFTER a completed delivery must not
             # overwrite the delivered run's terminal status — ok, or a failure whose notice already
@@ -3315,6 +3350,10 @@ def _run_one_job_body(
             _err_text,
             exc_info=(type(e), e, e.__traceback__))
         delivery_outcome = "suppressed"
+        # The Claude handoff must be durable before any operator-facing crash
+        # notice is attempted. BaseException is included because this handler
+        # records those interrupted attempts as failures before re-raising.
+        _escalate_cron_failure(job, "agent", _err_text)
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
         if (
