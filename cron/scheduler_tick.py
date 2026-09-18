@@ -22,6 +22,12 @@ def _tick_admitted(
     next allowed tick. Returns the number of jobs executed (0 if another tick holds the lock)."""
     from cron import scheduler as _sched
 
+    # Retry durable Claude handoffs before doing any ordinary cron work. Failures
+    # remain local because escalation of the escalation mechanism would recurse.
+    from cron.failure_escalation import retry_queued_escalations
+
+    retry_queued_escalations()
+
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.
