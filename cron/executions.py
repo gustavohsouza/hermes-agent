@@ -25,6 +25,7 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
+PROCESS_START_TIME_TOLERANCE_CENTISECONDS = 6000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -131,7 +132,12 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     if started_at is None:
         return pid == os.getpid()
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        return False
+    # psutil derives macOS create_time() from a boot-time estimate that can
+    # drift by several seconds while the process is still alive. The ledger
+    # stores centiseconds there, so exact equality falsely reaps live owners.
+    return abs(current - started_at) <= PROCESS_START_TIME_TOLERANCE_CENTISECONDS
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
