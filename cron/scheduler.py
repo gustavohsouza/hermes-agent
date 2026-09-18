@@ -2870,7 +2870,7 @@ def _escalate_cron_failure(job: dict, failure_class: str, error: object):
     """Durably hand a failure to Claude before any operator-facing notice."""
     from cron.failure_escalation import escalate_cron_failure
 
-    return escalate_cron_failure(job, failure_class, error)
+    return escalate_cron_failure(job, failure_class, error, live=True)
 
 
 def _failure_class(job: dict, error: object) -> str:
