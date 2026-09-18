@@ -2693,7 +2693,13 @@ def _save_compose_deliver(
         d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
     if not d.success:
-        _escalate_cron_failure(job, _failure_class(job, d.error), d.error)
+        escalation = _escalate_cron_failure(job, _failure_class(job, d.error), d.error)
+        if getattr(escalation, "status", None) == "queue_failed":
+            logger.error(
+                "Job '%s': suppressing failure delivery because escalation persistence failed",
+                job["id"],
+            )
+            return
     if empty_response:
         # Preserve the existing no-delivery contract for an empty model turn;
         # escalation is the durable failure signal and bookkeeping records it.
@@ -3012,11 +3018,13 @@ def _run_one_job_body(
         # The Claude handoff must be durable before any operator-facing crash
         # notice is attempted. BaseException is included because this handler
         # records those interrupted attempts as failures before re-raising.
-        _escalate_cron_failure(job, "agent", _err_text)
+        escalation = _escalate_cron_failure(job, "agent", _err_text)
+        escalation_persisted = getattr(escalation, "status", None) != "queue_failed"
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
         if (
             isinstance(e, Exception)
+            and escalation_persisted
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()

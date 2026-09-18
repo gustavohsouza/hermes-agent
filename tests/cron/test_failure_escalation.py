@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 from unittest.mock import Mock, patch
 
@@ -22,6 +25,82 @@ def _job(**overrides):
 def _capture(home):
     path = home / "cron" / "failure-escalations" / "test-capture.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _run_escalation_process(home, *, mode="one", start=100):
+    code = r'''
+import json
+import sys
+from pathlib import Path
+from cron.failure_escalation import escalate_cron_failure
+home = Path(sys.argv[1])
+mode = sys.argv[2]
+start = float(sys.argv[3])
+results = []
+count = 5 if mode == "five" else 2 if mode == "two" else 1
+for number in range(count):
+    suffix = number + (5 if mode == "two" else 0) if mode != "one" else 0
+    result = escalate_cron_failure(
+        {"id": f"job-{suffix}", "name": "Morning brief"},
+        "agent", f"failure-{suffix}", hermes_home=home, now=start + number,
+    )
+    results.append({"id": result.escalation_id, "deduped": result.deduped})
+print(json.dumps(results))
+'''
+    env = dict(os.environ)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    return subprocess.run(
+        [sys.executable, "-c", code, str(home), mode, str(start)],
+        check=True, capture_output=True, text=True, env=env,
+    )
+
+
+def test_dedupe_survives_process_restart(tmp_path):
+    first = json.loads(_run_escalation_process(tmp_path, start=100).stdout)
+    second = json.loads(_run_escalation_process(tmp_path, start=200).stdout)
+
+    assert first[0]["id"] == second[0]["id"]
+    assert second[0]["deduped"] is True
+    assert len(_capture(tmp_path)) == 1
+
+
+def test_rate_cap_survives_process_restart(tmp_path):
+    _run_escalation_process(tmp_path, mode="five", start=100)
+    _run_escalation_process(tmp_path, mode="two", start=200)
+
+    capture = _capture(tmp_path)
+    assert len([item for item in capture if item["kind"] == "escalation"]) == 5
+    assert len([item for item in capture if item["kind"] == "overflow_digest"]) == 1
+    state = json.loads(
+        (tmp_path / "cron" / "failure-escalations" / "rate-state.json").read_text()
+    )
+    assert state["suppressed_count"] == 2
+
+
+def test_concurrent_processes_capture_identical_failure_once(tmp_path):
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", r'''
+import sys
+from pathlib import Path
+from cron.failure_escalation import escalate_cron_failure
+escalate_cron_failure(
+    {"id": "job-1", "name": "Morning brief"}, "agent", "same concurrent error",
+    hermes_home=Path(sys.argv[1]), now=100,
+)
+''', str(tmp_path)],
+            env={key: value for key, value in os.environ.items() if key != "PYTEST_CURRENT_TEST"},
+        )
+        for _ in range(8)
+    ]
+    assert [process.wait(timeout=10) for process in processes] == [0] * 8
+
+    assert len(_capture(tmp_path)) == 1
+    queue_paths = list((tmp_path / "cron" / "failure-escalations").glob("cron-*.json"))
+    assert len(queue_paths) == 1
+    queue_path = queue_paths[0]
+    record = json.loads(queue_path.read_text())
+    assert record["occurrences"] == 8
 
 
 def test_pytest_gate_captures_and_never_calls_live_sender(tmp_path, monkeypatch):
@@ -195,6 +274,56 @@ print(json.dumps({'status': result.status, 'calls': len(calls), 'path': str(resu
     assert outcome["calls"] == 1
     record = json.loads(__import__("pathlib").Path(outcome["path"]).read_text())
     assert "bridge exploded" in record["bridge_error"]
+    failures = tmp_path / "cron" / "failure-escalations" / "local-failures.jsonl"
+    entries = [json.loads(line) for line in failures.read_text().splitlines()]
+    assert len(entries) == 1
+    assert entries[0]["operation"] == "bridge_send"
+    assert "bridge exploded" in entries[0]["detail"]
+
+
+def test_failed_durable_escalation_suppresses_normal_failure_delivery(monkeypatch):
+    from cron import scheduler
+    from cron.failure_escalation import EscalationResult
+
+    deliveries = Mock()
+    monkeypatch.setattr(
+        scheduler, "_escalate_cron_failure",
+        lambda *args: EscalationResult("id", "queue_failed", "failed"),
+    )
+    monkeypatch.setattr(scheduler, "_deliver_result", deliveries)
+
+    d = scheduler._RunDelivery(job=_job(deliver="origin"), success=False, error="agent exploded")
+    scheduler._save_compose_deliver(
+        d, scheduler._FireOwnership(d.job, None), "", "output",
+        adapters={}, loop=None, verbose=False, execution_token=None,
+    )
+
+    deliveries.assert_not_called()
+
+
+def test_failed_durable_escalation_suppresses_crash_failure_delivery(monkeypatch):
+    from cron import scheduler
+    from cron.failure_escalation import EscalationResult
+
+    crash_delivery = Mock()
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *args: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *args: {})
+    monkeypatch.setattr(scheduler, "run_job", Mock(side_effect=RuntimeError("agent exploded")))
+    monkeypatch.setattr(
+        scheduler, "_escalate_cron_failure",
+        lambda *args: EscalationResult("id", "queue_failed", "failed"),
+    )
+    monkeypatch.setattr(scheduler, "_deliver_crash_failure", crash_delivery)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: True)
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agent.secret_scope.set_secret_scope", lambda *args: None)
+    monkeypatch.setattr("agent.secret_scope.build_profile_secret_scope", lambda *args: None)
+    monkeypatch.setattr("agent.secret_scope.reset_secret_scope", lambda *args: None)
+    monkeypatch.setattr("tools.terminal_scope.install_profile_terminal_scope", lambda *args: None)
+    monkeypatch.setattr("tools.terminal_scope.reset_terminal_scope", lambda *args: None)
+
+    assert scheduler._run_one_job_body(_job(), execution_token=None) is False
+    crash_delivery.assert_not_called()
 
 
 def test_no_agent_script_failure_preserves_raw_stderr_and_escalates(tmp_path):
