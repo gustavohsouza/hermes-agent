@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from hermes_cli.active_sessions import _FileLock
+
 logger = logging.getLogger(__name__)
 
 _DEDUPE_SECONDS = 24 * 60 * 60
@@ -115,14 +117,30 @@ def _append_capture(queue_dir: Path, payload: dict) -> None:
         os.fsync(handle.fileno())
 
 
+def _log_local_failure(queue_dir: Path, operation: str, detail: object) -> None:
+    """Record escalation-system failures locally without invoking escalation again."""
+    payload = {
+        "timestamp": time.time(),
+        "operation": _normalize(operation),
+        "detail": _normalize(detail),
+    }
+    try:
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        with _FileLock(queue_dir / ".local-failure.lock"):
+            with (queue_dir / "local-failures.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+    except Exception:
+        # Terminal safety boundary: a logging failure must never recurse.
+        logger.exception("Cron escalation local failure log unavailable")
+
+
 def _rate_decision(queue_dir: Path, timestamp: float) -> tuple[str, int]:
     """Persist the ten-minute rate window and return send/digest/suppress."""
-    import fcntl
-
     state_path = queue_dir / "rate-state.json"
     queue_dir.mkdir(parents=True, exist_ok=True)
-    with (queue_dir / ".rate.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with _FileLock(queue_dir / ".rate.lock"):
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -189,21 +207,6 @@ def escalate_cron_failure(
     home = Path(hermes_home) if hermes_home is not None else _default_hermes_home()
     queue_dir = home / "cron" / "failure-escalations"
     record_path = queue_dir / f"{escalation_id}.json"
-
-    try:
-        if record_path.exists():
-            prior = json.loads(record_path.read_text(encoding="utf-8"))
-            if timestamp - float(prior.get("last_seen_at", 0)) < _DEDUPE_SECONDS:
-                prior["last_seen_at"] = timestamp
-                prior["occurrences"] = int(prior.get("occurrences", 1)) + 1
-                _atomic_json(record_path, prior)
-                return EscalationResult(
-                    escalation_id, str(prior.get("status") or "queued"),
-                    "Failure is pending Claude review.", True, record_path,
-                )
-    except Exception as exc:
-        logger.error("Cron escalation dedupe read failed: %s", _redact(str(exc)))
-
     report = _report(job, failure_class, evidence, escalation_id)
     record = {
         "schema_version": 1,
@@ -220,12 +223,26 @@ def escalate_cron_failure(
         "bridge_error": None,
         "bridge_response": None,
     }
+
     # Durability precedes transport: even a process death during POST leaves a
-    # retryable handoff, and no user-facing failure path can overtake it.
+    # retryable handoff, and no user-facing failure path can overtake it. The
+    # dedupe decision and initial write share one inter-process critical section.
     try:
-        _atomic_json(record_path, record)
+        with _FileLock(queue_dir / f".{escalation_id}.lock"):
+            if record_path.exists():
+                prior = json.loads(record_path.read_text(encoding="utf-8"))
+                if timestamp - float(prior.get("last_seen_at", 0)) < _DEDUPE_SECONDS:
+                    prior["last_seen_at"] = timestamp
+                    prior["occurrences"] = int(prior.get("occurrences", 1)) + 1
+                    _atomic_json(record_path, prior)
+                    return EscalationResult(
+                        escalation_id, str(prior.get("status") or "queued"),
+                        "Failure is pending Claude review.", True, record_path,
+                    )
+            _atomic_json(record_path, record)
     except Exception as exc:
         logger.error("Cron escalation durable queue write failed: %s", _redact(str(exc)))
+        _log_local_failure(queue_dir, "durable_queue_write", exc)
         return EscalationResult(
             escalation_id, "queue_failed", "Failure escalation could not be persisted."
         )
@@ -258,6 +275,7 @@ def escalate_cron_failure(
         report = message
     except Exception as exc:
         logger.error("Cron escalation local safety gate failed: %s", _normalize(exc))
+        _log_local_failure(queue_dir, "local_safety_gate", exc)
         return EscalationResult(
             escalation_id, "queue_failed", "Failure escalation could not be persisted.",
             False, record_path,
@@ -277,11 +295,20 @@ def escalate_cron_failure(
         "bridge_error": None if accepted else bridge_detail,
         "bridge_response": bridge_detail if accepted else None,
     })
+    if not accepted:
+        _log_local_failure(queue_dir, "bridge_send", bridge_detail)
     try:
-        _atomic_json(record_path, record)
+        with _FileLock(queue_dir / f".{escalation_id}.lock"):
+            # Preserve occurrence updates made by callers that deduped while the
+            # original transport was in flight.
+            current = json.loads(record_path.read_text(encoding="utf-8"))
+            record["occurrences"] = int(current.get("occurrences", record["occurrences"]))
+            record["last_seen_at"] = float(current.get("last_seen_at", record["last_seen_at"]))
+            _atomic_json(record_path, record)
     except Exception as exc:
         # The pre-send queued record is still durable. Do not recurse.
         logger.error("Cron escalation acknowledgement write failed: %s", _redact(str(exc)))
+        _log_local_failure(queue_dir, "acknowledgement_write", exc)
         status = "queued"
     return EscalationResult(
         escalation_id, status, "Failure is pending Claude review.", False, record_path
@@ -312,53 +339,56 @@ def retry_queued_escalations(
 
     for path in paths:
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            if record.get("status") != "queued":
-                continue
-            retry_count = int(record.get("retry_count", 0))
-            last_attempt = float(record.get("last_attempt_at", record.get("created_at", 0)))
-            if retry_count >= _MAX_RETRIES:
-                if record.get("status") != "dead_letter":
+            with _FileLock(queue_dir / f".{path.stem}.lock"):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record.get("status") != "queued":
+                    continue
+                retry_count = int(record.get("retry_count", 0))
+                last_attempt = float(record.get("last_attempt_at", record.get("created_at", 0)))
+                if retry_count >= _MAX_RETRIES:
                     record["status"] = "dead_letter"
                     record["dead_lettered_at"] = timestamp
                     _atomic_json(path, record)
-                continue
-            if timestamp - last_attempt < _RETRY_SECONDS:
-                continue
-            report = _report(
-                {"id": record.get("job_id"), "name": record.get("job_name")},
-                str(record.get("failure_class") or "unknown"),
-                str(record.get("raw_error") or "<missing failure evidence>"),
-                str(record.get("escalation_id") or path.stem),
-            )
-            decision, suppressed_count = _rate_decision(queue_dir, timestamp)
-            if decision == "suppress":
-                continue
-            if decision == "digest":
-                report = (
-                    "[ESCALATION DIGEST]\nAdditional cron failures are being aggregated locally "
-                    "by the 5-per-10-minute safety cap.\n"
+                    continue
+                if timestamp - last_attempt < _RETRY_SECONDS:
+                    continue
+                report = _report(
+                    {"id": record.get("job_id"), "name": record.get("job_name")},
+                    str(record.get("failure_class") or "unknown"),
+                    str(record.get("raw_error") or "<missing failure evidence>"),
+                    str(record.get("escalation_id") or path.stem),
                 )
-            if _TEST_PROCESS or not live:
-                _append_capture(queue_dir, {
-                    "kind": "overflow_digest" if decision == "digest" else "retry",
-                    "escalation_id": record.get("escalation_id") or path.stem,
-                    "message": report, "suppressed_count": suppressed_count, "timestamp": timestamp,
-                })
-                continue
-            ok, detail = sender(report)
-            record["retry_count"] = retry_count + 1
-            record["last_attempt_at"] = timestamp
-            if ok:
-                record["status"] = "pending_claude_review"
-                record["bridge_response"] = _redact(str(detail))
-                record["bridge_error"] = None
-                accepted_count += 1
-            else:
-                record["bridge_error"] = _redact(str(detail))
-            _atomic_json(path, record)
+                decision, suppressed_count = _rate_decision(queue_dir, timestamp)
+                if decision == "suppress":
+                    continue
+                if decision == "digest":
+                    report = (
+                        "[ESCALATION DIGEST]\nAdditional cron failures are being aggregated locally "
+                        "by the 5-per-10-minute safety cap.\n"
+                    )
+                if _TEST_PROCESS or not live:
+                    _append_capture(queue_dir, {
+                        "kind": "overflow_digest" if decision == "digest" else "retry",
+                        "escalation_id": record.get("escalation_id") or path.stem,
+                        "message": report, "suppressed_count": suppressed_count,
+                        "timestamp": timestamp,
+                    })
+                    continue
+                ok, detail = sender(report)
+                record["retry_count"] = retry_count + 1
+                record["last_attempt_at"] = timestamp
+                if ok:
+                    record["status"] = "pending_claude_review"
+                    record["bridge_response"] = _redact(str(detail))
+                    record["bridge_error"] = None
+                    accepted_count += 1
+                else:
+                    record["bridge_error"] = _redact(str(detail))
+                    _log_local_failure(queue_dir, "retry_bridge_send", detail)
+                _atomic_json(path, record)
         except Exception as exc:
             logger.error("Cron escalation queue retry failed for %s: %s", path.name, _redact(str(exc)))
+            _log_local_failure(queue_dir, "queue_retry", exc)
     return accepted_count
 
 
