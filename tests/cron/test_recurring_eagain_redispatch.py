@@ -19,17 +19,13 @@ behavioral RED (unfixed: no execution) / GREEN (fixed: re-dispatched) for the
 new recovery path.
 
 This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
-  tick 1 -> script EAGAINs (subprocess.run raises OSError 11) -> failed exec row
+  tick 1 -> script EAGAINs (subprocess.Popen raises OSError 11) -> failed exec row
   tick 2 -> substrate recovered (script runs clean) -> job MUST fire again
 """
 from __future__ import annotations
 
-import json
-import os
-import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -78,8 +74,9 @@ class TestEAGAINRecurringRedispatches:
         The script runner spawns via Popen (polling loop for cancel/timeout),
         so the substrate-failure injection point is the Popen constructor.
         """
-        import cron.scheduler as sched_mod
-        state = {"n": 0}
+        import cron.scheduler_script as script_mod
+        real_subprocess = script_mod.subprocess
+        state = {"n": 0, "eagain_argv": None}
 
         class _OkProc:
             def __init__(self, argv, **kwargs):
@@ -97,10 +94,19 @@ class TestEAGAINRecurringRedispatches:
         def fake_popen(argv, **kwargs):
             state["n"] += 1
             if state["n"] == 1:
+                state["eagain_argv"] = list(argv)
                 raise OSError(11, "Resource temporarily unavailable")
             return _OkProc(argv, **kwargs)
 
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        class _SubprocessProxy:
+            """Override only this module's Popen binding, not stdlib subprocess."""
+
+            Popen = staticmethod(fake_popen)
+
+            def __getattr__(self, name):
+                return getattr(real_subprocess, name)
+
+        monkeypatch.setattr(script_mod, "subprocess", _SubprocessProxy())
         return state
 
     def test_eagain_then_redispatched_on_next_tick(self, wedge_env, monkeypatch, tmp_path):
@@ -122,6 +128,8 @@ class TestEAGAINRecurringRedispatches:
         latest = E.latest_execution(env["job_id"])
         assert latest is not None, "tick 1 must create an execution"
         assert latest["status"] == "failed", f"expected failed, got {latest['status']}"
+        assert state["eagain_argv"] is not None
+        assert any(str(arg).endswith("probe.py") for arg in state["eagain_argv"])
 
         # The job must still be scheduled (recurring), next_run_at advanced.
         import cron.jobs as J
