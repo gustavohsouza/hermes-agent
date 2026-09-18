@@ -19,16 +19,195 @@ def _job(**overrides):
     }
 
 
+def _capture(home):
+    path = home / "cron" / "failure-escalations" / "test-capture.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_pytest_gate_captures_and_never_calls_live_sender(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "gate::test")
+    live_sender = Mock(side_effect=AssertionError("production sender called"))
+
+    result = escalate_cron_failure(
+        _job(), "agent", "synthetic failure", hermes_home=tmp_path,
+        bridge_send=live_sender, live=True,
+    )
+
+    live_sender.assert_not_called()
+    assert result.status == "captured_test"
+    capture = _capture(tmp_path)
+    assert capture[0]["escalation_id"] == result.escalation_id
+    assert capture[0]["message"].endswith("raw failure evidence: synthetic failure\n")
+
+
+def test_transport_requires_explicit_live_flag(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    live_sender = Mock(side_effect=AssertionError("production sender called"))
+
+    result = escalate_cron_failure(
+        _job(), "agent", "not explicitly live", hermes_home=tmp_path,
+        bridge_send=live_sender,
+    )
+
+    live_sender.assert_not_called()
+    assert result.status == "captured_test"
+    assert _capture(tmp_path)[0]["message"].endswith(
+        "raw failure evidence: not explicitly live\n"
+    )
+
+
+def test_pytest_gate_survives_current_test_env_removal(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    live_sender = Mock(side_effect=AssertionError("production sender called"))
+
+    result = escalate_cron_failure(
+        _job(), "agent", "still fenced", hermes_home=tmp_path,
+        bridge_send=live_sender, live=True,
+    )
+
+    live_sender.assert_not_called()
+    assert result.status == "captured_test"
+
+
+def test_evidence_is_bounded_string_and_never_leaks_mock_repr(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "normalization::test")
+    evidence = Mock()
+    evidence.__str__ = Mock(return_value="<MagicMock name='token-secret' id='12345'>" + "x" * 20_000)
+
+    result = escalate_cron_failure(
+        _job(), "agent", evidence, hermes_home=tmp_path, live=True,
+    )
+
+    record = json.loads(result.queue_path.read_text())
+    assert len(record["raw_error"]) <= 8192
+    assert "MagicMock" not in record["raw_error"]
+    assert "id='12345'" not in record["raw_error"]
+    assert record["raw_error"].endswith("[truncated]")
+
+
+def test_dedupe_survives_a_fresh_module_import(tmp_path, monkeypatch):
+    import importlib
+    import cron.failure_escalation as failure_escalation
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "dedupe::test")
+    first = failure_escalation.escalate_cron_failure(
+        _job(), "agent", "same exact error", hermes_home=tmp_path, now=100, live=True,
+    )
+    reloaded = importlib.reload(failure_escalation)
+    second = reloaded.escalate_cron_failure(
+        _job(), "agent", "same exact error", hermes_home=tmp_path, now=200, live=True,
+    )
+
+    assert first.escalation_id == second.escalation_id
+    assert second.deduped is True
+    assert len(_capture(tmp_path)) == 1
+
+
+def test_rate_cap_emits_one_overflow_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "rate::test")
+
+    for number in range(8):
+        escalate_cron_failure(
+            _job(id=f"job-{number}"), "agent", f"failure-{number}",
+            hermes_home=tmp_path, now=100 + number, live=True,
+        )
+
+    capture = _capture(tmp_path)
+    individual = [item for item in capture if item["kind"] == "escalation"]
+    digests = [item for item in capture if item["kind"] == "overflow_digest"]
+    assert len(individual) == 5
+    assert len(digests) == 1
+    assert digests[0]["suppressed_count"] == 1
+    state = json.loads(
+        (tmp_path / "cron" / "failure-escalations" / "rate-state.json").read_text()
+    )
+    assert state["suppressed_count"] == 3
+
+
+def test_rate_cap_state_survives_module_restart(tmp_path, monkeypatch):
+    import importlib
+    import cron.failure_escalation as failure_escalation
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "rate-restart::test")
+    for number in range(5):
+        failure_escalation.escalate_cron_failure(
+            _job(id=f"before-{number}"), "agent", f"failure-{number}",
+            hermes_home=tmp_path, now=100 + number, live=True,
+        )
+    reloaded = importlib.reload(failure_escalation)
+    reloaded.escalate_cron_failure(
+        _job(id="after-1"), "agent", "overflow-1", hermes_home=tmp_path, now=200, live=True,
+    )
+    reloaded.escalate_cron_failure(
+        _job(id="after-2"), "agent", "overflow-2", hermes_home=tmp_path, now=201, live=True,
+    )
+
+    capture = _capture(tmp_path)
+    assert len([item for item in capture if item["kind"] == "escalation"]) == 5
+    assert len([item for item in capture if item["kind"] == "overflow_digest"]) == 1
+    state = json.loads(
+        (tmp_path / "cron" / "failure-escalations" / "rate-state.json").read_text()
+    )
+    assert state["suppressed_count"] == 2
+
+
+def test_corrupt_rate_state_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "corrupt-rate::test")
+    queue = tmp_path / "cron" / "failure-escalations"
+    queue.mkdir(parents=True)
+    (queue / "rate-state.json").write_text("not json")
+
+    result = escalate_cron_failure(
+        _job(), "agent", "failure", hermes_home=tmp_path, now=100, live=True,
+    )
+
+    assert result.status == "captured_test"
+    assert _capture(tmp_path)[0]["kind"] == "overflow_digest"
+
+
+def test_escalation_failure_is_local_and_non_recursive(tmp_path):
+    import subprocess
+    import sys
+
+    code = """
+import json
+import sys
+from pathlib import Path
+from cron.failure_escalation import escalate_cron_failure
+calls = []
+def failing_sender(message):
+    calls.append(message)
+    raise RuntimeError('bridge exploded')
+result = escalate_cron_failure(
+    {'id': 'job-1', 'name': 'Morning brief'}, 'agent', 'original failure',
+    hermes_home=Path(sys.argv[1]), bridge_send=failing_sender, live=True,
+)
+print(json.dumps({'status': result.status, 'calls': len(calls), 'path': str(result.queue_path)}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)], text=True, capture_output=True, check=True,
+        env={key: value for key, value in __import__("os").environ.items()
+             if key != "PYTEST_CURRENT_TEST"},
+    )
+
+    outcome = json.loads(completed.stdout)
+    assert outcome["status"] == "queued"
+    assert outcome["calls"] == 1
+    record = json.loads(__import__("pathlib").Path(outcome["path"]).read_text())
+    assert "bridge exploded" in record["bridge_error"]
+
+
 def test_no_agent_script_failure_preserves_raw_stderr_and_escalates(tmp_path):
-    bridge = Mock(return_value=(True, "accepted"))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     result = escalate_cron_failure(
         _job(no_agent=True), "script", "exit 7\nstderr: AZURE_TOKEN missing",
         hermes_home=tmp_path, bridge_send=bridge,
     )
 
-    assert result.status == "pending_claude_review"
-    report = bridge.call_args.args[0]
+    bridge.assert_not_called()
+    assert result.status == "captured_test"
+    report = _capture(tmp_path)[0]["message"]
     assert report.startswith("[ESCALATION]\n")
     assert "exit 7\nstderr: AZURE_TOKEN missing" in report
     assert "failure_deliver=local" in report
@@ -36,7 +215,7 @@ def test_no_agent_script_failure_preserves_raw_stderr_and_escalates(tmp_path):
 
 
 def test_monitor_and_agent_failures_are_escalated(tmp_path):
-    bridge = Mock(return_value=(True, "accepted"))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     for failure_class, raw in (
         ("monitor", "monitor_url fetch failed: HTTP 503"),
@@ -48,35 +227,39 @@ def test_monitor_and_agent_failures_are_escalated(tmp_path):
             _job(id=f"job-{failure_class}"), failure_class, raw,
             hermes_home=tmp_path, bridge_send=bridge,
         )
-        assert result.status == "pending_claude_review"
-        assert raw in bridge.call_args.args[0]
+        assert result.status == "captured_test"
+        assert raw in _capture(tmp_path)[-1]["message"]
+    bridge.assert_not_called()
 
 
 def test_na_like_output_is_an_explicit_failure_not_healthy(tmp_path):
-    bridge = Mock(return_value=(True, "accepted"))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     result = escalate_cron_failure(
         _job(), "script", "n/a", hermes_home=tmp_path, bridge_send=bridge,
     )
 
-    assert result.status == "pending_claude_review"
-    assert "raw failure evidence: n/a" in bridge.call_args.args[0].lower()
+    bridge.assert_not_called()
+    assert result.status == "captured_test"
+    assert "raw failure evidence: n/a" in _capture(tmp_path)[0]["message"].lower()
     assert result.public_error
 
 
-def test_bridge_unavailable_creates_durable_queue_record(tmp_path):
+def test_test_gate_creates_durable_local_record_without_bridge(tmp_path):
+    bridge = Mock(side_effect=AssertionError("production sender called"))
     result = escalate_cron_failure(
         _job(), "agent", "ProviderError: offline", hermes_home=tmp_path,
-        bridge_send=Mock(return_value=(False, "connection refused")),
+        bridge_send=bridge,
     )
 
-    assert result.status == "queued"
+    bridge.assert_not_called()
+    assert result.status == "captured_test"
     assert result.queue_path is not None and result.queue_path.exists()
     record = json.loads(result.queue_path.read_text())
-    assert record["status"] == "queued"
+    assert record["status"] == "captured_test"
     assert record["retry_count"] == 0
     assert record["raw_error"] == "ProviderError: offline"
-    assert "connection refused" in record["bridge_error"]
+    assert record["bridge_error"] is None
 
 
 def test_job_metadata_is_redacted_before_transport_and_persistence(tmp_path, monkeypatch):
@@ -84,33 +267,33 @@ def test_job_metadata_is_redacted_before_transport_and_persistence(tmp_path, mon
         "agent.redact.redact_sensitive_text",
         lambda text: text.replace("secret-name", "[REDACTED]")
     )
-    bridge = Mock(return_value=(True, "accepted"))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     result = escalate_cron_failure(
         _job(name="secret-name"), "agent", "boom", hermes_home=tmp_path, bridge_send=bridge,
     )
 
-    assert "secret-name" not in bridge.call_args.args[0]
+    bridge.assert_not_called()
+    assert "secret-name" not in _capture(tmp_path)[0]["message"]
     assert result.queue_path is not None
     assert json.loads(result.queue_path.read_text())["job_name"] == "[REDACTED]"
 
 
-def test_queue_is_persisted_before_bridge_attempt(tmp_path):
-    def bridge(_message):
-        queued = list((tmp_path / "cron" / "failure-escalations").glob("*.json"))
-        assert len(queued) == 1
-        assert json.loads(queued[0].read_text())["status"] == "queued"
-        return True, "accepted"
+def test_queue_is_persisted_before_capture(tmp_path):
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     result = escalate_cron_failure(
         _job(), "agent", "boom", hermes_home=tmp_path, bridge_send=bridge,
     )
 
-    assert result.status == "pending_claude_review"
+    bridge.assert_not_called()
+    assert result.status == "captured_test"
+    assert result.queue_path is not None and result.queue_path.exists()
+    assert len(_capture(tmp_path)) == 1
 
 
 def test_identical_failure_is_deduped_for_24_hours(tmp_path):
-    bridge = Mock(return_value=(True, "accepted"))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     first = escalate_cron_failure(
         _job(), "agent", "same exact error", hermes_home=tmp_path, bridge_send=bridge,
@@ -119,35 +302,39 @@ def test_identical_failure_is_deduped_for_24_hours(tmp_path):
         _job(), "agent", "same exact error", hermes_home=tmp_path, bridge_send=bridge,
     )
 
+    bridge.assert_not_called()
     assert first.escalation_id == second.escalation_id
     assert second.deduped is True
-    assert bridge.call_count == 1
+    assert len(_capture(tmp_path)) == 1
 
 
-def test_queued_failure_is_retried_after_backoff(tmp_path):
+def test_queued_failure_retry_is_captured_under_pytest(tmp_path):
     first = escalate_cron_failure(
-        _job(), "agent", "offline", hermes_home=tmp_path,
-        bridge_send=Mock(return_value=(False, "connection refused")), now=100,
+        _job(), "agent", "offline", hermes_home=tmp_path, now=100,
     )
-    bridge = Mock(return_value=(True, "accepted"))
+    assert first.queue_path is not None
+    record = json.loads(first.queue_path.read_text())
+    record["status"] = "queued"
+    first.queue_path.write_text(json.dumps(record))
+    bridge = Mock(side_effect=AssertionError("production sender called"))
 
     accepted = retry_queued_escalations(
         hermes_home=tmp_path, bridge_send=bridge, now=401,
     )
 
-    assert accepted == 1
-    assert first.queue_path is not None
-    assert json.loads(first.queue_path.read_text())["status"] == "pending_claude_review"
-    assert bridge.call_count == 1
+    bridge.assert_not_called()
+    assert accepted == 0
+    assert json.loads(first.queue_path.read_text())["status"] == "queued"
+    assert _capture(tmp_path)[-1]["kind"] == "retry"
 
 
 def test_exhausted_queue_record_is_retained_as_dead_letter(tmp_path):
     first = escalate_cron_failure(
-        _job(), "agent", "offline", hermes_home=tmp_path,
-        bridge_send=Mock(return_value=(False, "connection refused")), now=100,
+        _job(), "agent", "offline", hermes_home=tmp_path, now=100,
     )
     assert first.queue_path is not None
     record = json.loads(first.queue_path.read_text())
+    record["status"] = "queued"
     record["retry_count"] = 24
     first.queue_path.write_text(json.dumps(record))
 

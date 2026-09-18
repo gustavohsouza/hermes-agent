@@ -2590,7 +2590,7 @@ def _escalate_cron_failure(job: dict, failure_class: str, error: object):
     """Durably hand a failure to Claude before any operator-facing notice."""
     from cron.failure_escalation import escalate_cron_failure
 
-    return escalate_cron_failure(job, failure_class, error)
+    return escalate_cron_failure(job, failure_class, error, live=True)
 
 
 def _failure_class(job: dict, error: object) -> str:
@@ -3802,7 +3802,7 @@ def tick(
     # remain local because escalation of the escalation mechanism would recurse.
     from cron.failure_escalation import retry_queued_escalations
 
-    retry_queued_escalations()
+    retry_queued_escalations(live=True)
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.

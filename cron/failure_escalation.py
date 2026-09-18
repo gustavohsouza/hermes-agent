@@ -11,6 +11,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import sys
 import tempfile
 import time
 import urllib.error
@@ -25,6 +27,12 @@ _DEDUPE_SECONDS = 24 * 60 * 60
 _RETRY_SECONDS = 5 * 60
 _MAX_RETRIES = 24
 _BRIDGE_URL = "http://127.0.0.1:8787"
+_RATE_WINDOW_SECONDS = 10 * 60
+_RATE_MAX = 5
+_EVIDENCE_MAX = 8192
+_MOCK_RE = re.compile(r"<(?:(?:NonCallable)?MagicMock|Mock)\b[^>]*>")
+# Snapshot at import so a test cannot bypass the fence by deleting the env var.
+_TEST_PROCESS = bool(os.environ.get("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules
 
 
 @dataclass(frozen=True)
@@ -47,7 +55,24 @@ def _redact(text: str) -> str:
 
 
 def _redact_field(value: object) -> str:
-    return _redact(str(value or ""))
+    return _normalize(value, missing="")
+
+
+def _normalize(value: object, *, missing: str = "<missing failure evidence>") -> str:
+    """Return bounded, redacted text without test-double internals."""
+    if value is None:
+        text = missing
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            text = "<unprintable value>"
+    text = _MOCK_RE.sub("[test double]", text)
+    text = _redact(text)
+    marker = "...[truncated]"
+    if len(text) > _EVIDENCE_MAX:
+        text = text[: _EVIDENCE_MAX - len(marker)] + marker
+    return text
 
 
 def _bridge_send(message: str) -> tuple[bool, str]:
@@ -82,6 +107,47 @@ def _atomic_json(path: Path, payload: dict) -> None:
             pass
 
 
+def _append_capture(queue_dir: Path, payload: dict) -> None:
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    with (queue_dir / "test-capture.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _rate_decision(queue_dir: Path, timestamp: float) -> tuple[str, int]:
+    """Persist the ten-minute rate window and return send/digest/suppress."""
+    import fcntl
+
+    state_path = queue_dir / "rate-state.json"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    with (queue_dir / ".rate.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            state = {"window_started_at": timestamp, "sent_count": 0, "suppressed_count": 0,
+                     "digest_emitted": False}
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            # Corrupt quota state fails closed for the current window.
+            state = {"window_started_at": timestamp, "sent_count": _RATE_MAX,
+                     "suppressed_count": 0, "digest_emitted": False}
+        if timestamp - float(state.get("window_started_at", timestamp)) >= _RATE_WINDOW_SECONDS:
+            state = {"window_started_at": timestamp, "sent_count": 0, "suppressed_count": 0,
+                     "digest_emitted": False}
+        if int(state.get("sent_count", 0)) < _RATE_MAX:
+            state["sent_count"] = int(state.get("sent_count", 0)) + 1
+            decision = "send"
+        else:
+            state["suppressed_count"] = int(state.get("suppressed_count", 0)) + 1
+            decision = "suppress"
+            if not state.get("digest_emitted"):
+                state["digest_emitted"] = True
+                decision = "digest"
+        _atomic_json(state_path, state)
+        return decision, int(state.get("suppressed_count", 0))
+
+
 def _report(job: dict, failure_class: str, raw_error: str, escalation_id: str) -> str:
     return (
         "[ESCALATION]\n"
@@ -105,6 +171,7 @@ def escalate_cron_failure(
     hermes_home: Optional[Path] = None,
     bridge_send: Optional[Callable[[str], tuple[bool, str]]] = None,
     now: Optional[float] = None,
+    live: bool = False,
 ) -> EscalationResult:
     """Persist and send one Claude handoff, deduping the same blocker for 24h.
 
@@ -112,8 +179,9 @@ def escalate_cron_failure(
     function never raises: escalation-system failures must not recurse.
     """
     timestamp = time.time() if now is None else now
-    evidence = _redact(str(raw_error) if raw_error is not None else "<missing failure evidence>")
-    job_id = str(job.get("id") or "unknown")
+    evidence = _normalize(raw_error)
+    job_id = _normalize(job.get("id") or "unknown")
+    failure_class = _normalize(failure_class, missing="unknown")
     fingerprint = hashlib.sha256(
         f"{job_id}\0{failure_class}\0{evidence}".encode("utf-8", errors="replace")
     ).hexdigest()
@@ -162,14 +230,47 @@ def escalate_cron_failure(
             escalation_id, "queue_failed", "Failure escalation could not be persisted."
         )
 
+    # Pytest is a hard delivery fence. Explicit live=True is also required outside
+    # tests, so accidental callers can only write the local capture ledger.
+    test_mode = _TEST_PROCESS or not live
+    try:
+        decision, suppressed_count = _rate_decision(queue_dir, timestamp)
+        if decision == "suppress":
+            return EscalationResult(
+                escalation_id, "rate_limited", "Failure is pending Claude review.", False, record_path
+            )
+        kind = "overflow_digest" if decision == "digest" else "escalation"
+        message = (
+            "[ESCALATION DIGEST]\nAdditional cron failures are being aggregated locally "
+            "by the 5-per-10-minute safety cap.\n"
+            if decision == "digest" else report
+        )
+        if test_mode:
+            _append_capture(queue_dir, {
+                "kind": kind, "escalation_id": escalation_id, "message": message,
+                "suppressed_count": suppressed_count, "timestamp": timestamp,
+            })
+            record["status"] = "captured_test"
+            _atomic_json(record_path, record)
+            return EscalationResult(
+                escalation_id, "captured_test", "Failure is pending Claude review.", False, record_path
+            )
+        report = message
+    except Exception as exc:
+        logger.error("Cron escalation local safety gate failed: %s", _normalize(exc))
+        return EscalationResult(
+            escalation_id, "queue_failed", "Failure escalation could not be persisted.",
+            False, record_path,
+        )
+
     sender = bridge_send or _bridge_send
     accepted = False
     bridge_detail = "bridge send not attempted"
     try:
         accepted, bridge_detail = sender(report)
     except Exception as exc:
-        bridge_detail = f"{type(exc).__name__}: {exc}"
-    bridge_detail = _redact(str(bridge_detail))
+        bridge_detail = f"{type(exc).__name__}: {_normalize(exc)}"
+    bridge_detail = _normalize(bridge_detail)
     status = "pending_claude_review" if accepted else "queued"
     record.update({
         "status": status,
@@ -191,6 +292,7 @@ def retry_queued_escalations(
     *, hermes_home: Optional[Path] = None,
     bridge_send: Optional[Callable[[str], tuple[bool, str]]] = None,
     now: Optional[float] = None,
+    live: bool = False,
 ) -> int:
     """Retry due queued handoffs; return the number accepted by the bridge.
 
@@ -229,6 +331,21 @@ def retry_queued_escalations(
                 str(record.get("raw_error") or "<missing failure evidence>"),
                 str(record.get("escalation_id") or path.stem),
             )
+            decision, suppressed_count = _rate_decision(queue_dir, timestamp)
+            if decision == "suppress":
+                continue
+            if decision == "digest":
+                report = (
+                    "[ESCALATION DIGEST]\nAdditional cron failures are being aggregated locally "
+                    "by the 5-per-10-minute safety cap.\n"
+                )
+            if _TEST_PROCESS or not live:
+                _append_capture(queue_dir, {
+                    "kind": "overflow_digest" if decision == "digest" else "retry",
+                    "escalation_id": record.get("escalation_id") or path.stem,
+                    "message": report, "suppressed_count": suppressed_count, "timestamp": timestamp,
+                })
+                continue
             ok, detail = sender(report)
             record["retry_count"] = retry_count + 1
             record["last_attempt_at"] = timestamp
