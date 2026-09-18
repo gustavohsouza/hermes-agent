@@ -11,7 +11,7 @@ import logging
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,21 @@ def _guarded_store_write(action, description, *args, **kwargs):
         action(*args, **kwargs)
     except BaseException as e:  # noqa: BLE001 - mirror the tick body's BaseException policy
         logger.warning("Cron %s write failed: %s", description, e, exc_info=True)
+        _escalate_scheduler_failure(e)
+
+
+def _escalate_scheduler_failure(error: BaseException) -> None:
+    """Best-effort, non-recursive Claude handoff for scheduler-level failures."""
+    try:
+        from cron.failure_escalation import escalate_cron_failure
+
+        escalate_cron_failure(
+            {"id": "cron-scheduler", "name": "Cron scheduler", "failure_deliver": "local"},
+            "scheduler",
+            f"{type(error).__name__}: {error}",
+        )
+    except BaseException as escalation_error:
+        logger.error("Cron scheduler escalation failed: %s", escalation_error)
 
 
 def _profile_entry(entry) -> tuple:
@@ -70,7 +85,9 @@ def _profile_entry(entry) -> tuple:
     return entry if isinstance(entry, tuple) else (None, entry)
 
 
-def _existing_profile_homes(profile_homes: list) -> list:
+def _existing_profile_homes(
+    profile_homes: Iterable | Callable[[], Iterable],
+) -> list:
     """Drop homes no longer on disk: ticking/heartbeating a deleted home would recreate its
     ``cron/`` workspace and silently resurrect the profile.
 
@@ -85,8 +102,9 @@ def _existing_profile_homes(profile_homes: list) -> list:
         # restart; a raising enumerator keeps this cycle at zero homes rather than killing the ticker.
         try:
             profile_homes = list(profile_homes())
-        except Exception:
+        except Exception as exc:
             logger.warning("cron profile enumeration failed; skipping this cycle", exc_info=True)
+            _escalate_scheduler_failure(exc)
             return []
     return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
 
@@ -448,6 +466,7 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat()
         except BaseException as e:
             logger.error("Cron startup recovery error: %s", e, exc_info=True)
+            _escalate_scheduler_failure(e)
             _guarded_store_write(
                 record_ticker_error, "startup error", f"{type(e).__name__}: {e}"
             )
@@ -477,6 +496,7 @@ class InProcessCronScheduler(CronScheduler):
                     logger.info("Cron tick yielded: %s", e)
                 else:
                     logger.error("Cron tick error: %s", e, exc_info=True)
+                    _escalate_scheduler_failure(e)
                 # Persist the reason so `hermes cron status` (separate process) shows WHY.
                 _guarded_store_write(
                     record_ticker_error, "tick error", f"{type(e).__name__}: {e}"
@@ -544,6 +564,7 @@ class InProcessCronScheduler(CronScheduler):
                 logger.error(
                     "Cron startup recovery error for profile at %s: %s", home, e, exc_info=True
                 )
+                _escalate_scheduler_failure(e)
 
         consecutive_failures = 0
         while not stop_event.is_set():
@@ -565,6 +586,7 @@ class InProcessCronScheduler(CronScheduler):
                 cycle_homes = enumerated
             except BaseException as e:
                 logger.error("Cron profile enumeration error: %s", e, exc_info=True)
+                _escalate_scheduler_failure(e)
                 _tick_error = f"{type(e).__name__}: {e}"
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             try:
@@ -587,6 +609,7 @@ class InProcessCronScheduler(CronScheduler):
                             logger.error(
                                 "Cron tick error for profile at %s: %s", home, e, exc_info=True
                             )
+                            _escalate_scheduler_failure(e)
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
                             if _cycle_exc is None or _is_fd_exhaustion(e):
                                 _cycle_exc = e
@@ -595,6 +618,7 @@ class InProcessCronScheduler(CronScheduler):
                         consecutive_failures = _note_tick_failure(_cycle_exc, consecutive_failures)
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
+                _escalate_scheduler_failure(e)
                 _tick_error = f"{type(e).__name__}: {e}"
                 # EMFILE: reclaim fds + exponential backoff (#87644).
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
