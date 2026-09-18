@@ -78,21 +78,27 @@ def test_rate_cap_survives_process_restart(tmp_path):
 
 
 def test_concurrent_processes_capture_identical_failure_once(tmp_path):
+    start_file = tmp_path / "start"
     processes = [
         subprocess.Popen(
             [sys.executable, "-c", r'''
 import sys
+import time
 from pathlib import Path
 from cron.failure_escalation import escalate_cron_failure
+start_file = Path(sys.argv[2])
+while not start_file.exists():
+    time.sleep(0.001)
 escalate_cron_failure(
     {"id": "job-1", "name": "Morning brief"}, "agent", "same concurrent error",
     hermes_home=Path(sys.argv[1]), now=100,
 )
-''', str(tmp_path)],
+''', str(tmp_path), str(start_file)],
             env={key: value for key, value in os.environ.items() if key != "PYTEST_CURRENT_TEST"},
         )
         for _ in range(8)
     ]
+    start_file.touch()
     assert [process.wait(timeout=10) for process in processes] == [0] * 8
 
     assert len(_capture(tmp_path)) == 1
@@ -324,6 +330,59 @@ def test_failed_durable_escalation_suppresses_crash_failure_delivery(monkeypatch
 
     assert scheduler._run_one_job_body(_job(), execution_token=None) is False
     crash_delivery.assert_not_called()
+
+
+def test_execution_creation_failure_is_escalated_before_return(monkeypatch):
+    from cron import scheduler
+
+    escalations = Mock()
+    monkeypatch.setattr(scheduler, "_escalate_cron_failure", escalations)
+    monkeypatch.setattr(scheduler, "create_execution", Mock(side_effect=OSError("ledger offline")))
+    monkeypatch.setattr(scheduler, "try_register_running_job", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "release_running_job", Mock())
+
+    assert scheduler._submit_with_guard(_job(), Mock(), Mock()) is None
+    escalations.assert_called_once()
+    assert escalations.call_args.args[1] == "scheduler"
+    assert "execution creation failed: OSError: ledger offline" in escalations.call_args.args[2]
+
+
+def test_executor_submit_failure_is_escalated_before_return(monkeypatch):
+    from cron import scheduler
+
+    escalations = Mock()
+    pool = Mock()
+    pool.submit.side_effect = RuntimeError("executor unavailable")
+    monkeypatch.setattr(scheduler, "_escalate_cron_failure", escalations)
+    monkeypatch.setattr(scheduler, "create_execution", lambda *args, **kwargs: {"id": "exec-1"})
+    monkeypatch.setattr(scheduler, "finish_execution", Mock())
+    monkeypatch.setattr(scheduler, "try_register_running_job", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "release_running_job", Mock())
+    monkeypatch.setattr(scheduler, "_interpreter_shutting_down", lambda *args: False)
+
+    assert scheduler._submit_with_guard(_job(), pool, Mock()) is None
+    escalations.assert_called_once()
+    assert escalations.call_args.args[1] == "scheduler"
+    assert "executor dispatch failed: RuntimeError: executor unavailable" in escalations.call_args.args[2]
+
+
+def test_post_tick_cleanup_failure_is_escalated(monkeypatch):
+    from cron import scheduler
+
+    escalations = Mock()
+    monkeypatch.setattr(scheduler, "_escalate_cron_failure", escalations)
+    monkeypatch.setattr(
+        "tools.mcp_tool_lifecycle._kill_orphaned_mcp_children",
+        Mock(side_effect=RuntimeError("cleanup exploded")),
+    )
+
+    scheduler._sweep_mcp_orphans()
+
+    escalations.assert_called_once()
+    assert escalations.call_args.args[1] == "scheduler"
+    assert "post-tick MCP orphan cleanup failed: RuntimeError: cleanup exploded" in (
+        escalations.call_args.args[2]
+    )
 
 
 def test_no_agent_script_failure_preserves_raw_stderr_and_escalates(tmp_path):

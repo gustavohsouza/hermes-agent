@@ -267,8 +267,13 @@ def escalate_cron_failure(
                 "kind": kind, "escalation_id": escalation_id, "message": message,
                 "suppressed_count": suppressed_count, "timestamp": timestamp,
             })
-            record["status"] = "captured_test"
-            _atomic_json(record_path, record)
+            # A concurrent duplicate may increment occurrences after the initial
+            # queue write. Do not overwrite those increments with this process's
+            # stale in-memory record when recording the captured status.
+            with _FileLock(queue_dir / f".{escalation_id}.lock"):
+                current = json.loads(record_path.read_text(encoding="utf-8"))
+                current["status"] = "captured_test"
+                _atomic_json(record_path, current)
             return EscalationResult(
                 escalation_id, "captured_test", "Failure is pending Claude review.", False, record_path
             )
