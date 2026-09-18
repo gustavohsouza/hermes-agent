@@ -3,6 +3,8 @@
 import concurrent.futures
 import contextlib
 
+from cron.failure_escalation import retry_queued_escalations
+
 
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
     from hermes_cli.backend_retirement import retirement
@@ -24,8 +26,6 @@ def _tick_admitted(
 
     # Retry durable Claude handoffs before doing any ordinary cron work. Failures
     # remain local because escalation of the escalation mechanism would recurse.
-    from cron.failure_escalation import retry_queued_escalations
-
     retry_queued_escalations(live=True)
 
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
