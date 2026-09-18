@@ -74,6 +74,7 @@ def _escalate_scheduler_failure(error: BaseException) -> None:
             {"id": "cron-scheduler", "name": "Cron scheduler", "failure_deliver": "local"},
             "scheduler",
             f"{type(error).__name__}: {error}",
+            live=True,
         )
     except BaseException as escalation_error:
         logger.error("Cron scheduler escalation failed: %s", escalation_error)

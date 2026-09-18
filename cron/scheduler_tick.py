@@ -26,7 +26,7 @@ def _tick_admitted(
     # remain local because escalation of the escalation mechanism would recurse.
     from cron.failure_escalation import retry_queued_escalations
 
-    retry_queued_escalations()
+    retry_queued_escalations(live=True)
 
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
