@@ -3773,7 +3773,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             raise AuxiliaryExplicitCancellation()
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
-        where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
+        # Local patch (2026-09-10): report the route call_llm ACTUALLY selected (recorded in _aux_route),
+        # not the compressor's main runtime; a wrong label once sent a six-day investigation to the wrong
+        # backend. Fall back to the main runtime only when the route is genuinely unknown.
+        where = (
+            f"(provider={_aux_route.get('provider') or self.provider or 'auto'} "
+            f"model={_aux_route.get('model') or self.summary_model or self.model}"
+            + (f" base_url={_aux_route['base_url']}" if _aux_route.get("base_url") else "")
+            + ")"
+        )
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
         # payload passes ``_validate_llm_response`` (a ``message`` exists), so it reaches here and would
@@ -4054,9 +4062,26 @@ Write only the summary body. Do not include any preamble or prefix."""
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
         if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
+            _explicit_summary_model = bool(self.summary_model)
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
-            # Retry immediately on the main model.
-            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            if _explicit_summary_model:
+                # Legacy path, unchanged: summary_model was pinned explicitly and clearing it above is
+                # enough for the retry to resolve to the main model.
+                return self._generate_summary(
+                    turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context
+                )
+            # Retry on the main model, PINNED (local patch 2026-09-10, rebased 2026-09-26). When the
+            # summarizer comes from auxiliary.compression (summary_model ""), call_llm(task="compression")
+            # would resolve the same aux route from config again and the "retry" would repeat the identical
+            # failing call. _fallback_to_main_for_compression already set _summary_model_fallen_back, so
+            # this recursion happens at most once.
+            with pin_summary_route({
+                "provider": self.provider, "model": self.model, "base_url": self.base_url,
+                "api_key": self.api_key, "api_mode": self.api_mode,
+            }):
+                return self._generate_summary(
+                    turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context
+                )
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation
